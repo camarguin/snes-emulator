@@ -8,6 +8,7 @@ import qrcode from 'qrcode-generator'
 import { RemoteHost } from './remote/host'
 import { runController } from './remote/controller'
 import { PAD_PARAM } from './remote/protocol'
+import { createOfferSession, QrScanner, type OfferSession } from './remote/offline'
 
 const app = document.querySelector<HTMLDivElement>('#app')!
 
@@ -130,6 +131,7 @@ function phoneCard(): string {
         <h2>Use your iPhone as a controller</h2>
         <p>Open the Camera on your iPhone, scan this code and tap the link. Scan with a second phone for Player 2.</p>
         <p class="phone-status${remote.phoneCount > 0 ? ' ok' : ''}">${phoneStatusText()}</p>
+        <button class="pair-offline-btn${remote.status === 'offline' ? ' urgent' : ''}" data-action="pair-offline">No internet? Pair without internet</button>
       </div>
     </section>`
 }
@@ -140,6 +142,87 @@ function refreshPhoneCard(): void {
 }
 
 remote.onChange = () => refreshPhoneCard()
+
+// ------------------------------------------------- offline (QR) pairing
+
+let offerSession: OfferSession | null = null
+let offerScanner: QrScanner | null = null
+
+document.addEventListener('click', (e) => {
+  if ((e.target as HTMLElement).closest('[data-action="pair-offline"]')) void openOfflinePairing()
+})
+
+/**
+ * iPad side of serverless pairing: show an offer QR for the phone and watch
+ * the front camera for the phone's answer QR.
+ */
+async function openOfflinePairing(): Promise<void> {
+  closeOfflinePairing()
+  const overlay = document.createElement('div')
+  overlay.id = 'offline-pair'
+  overlay.innerHTML = `
+    <div class="pair-box wide">
+      <h2>Pair without internet</h2>
+      <p class="lead">Both devices must be on the same network — the iPhone’s <b>Personal Hotspot</b> works best.</p>
+      <div class="pair-steps">
+        <div class="pair-step">
+          <span class="step-n">1</span>
+          <div class="pair-qr" id="offer-qr"><div class="spinner"></div></div>
+          <p>Scan with the iPhone Camera, or tap <b>Pair without internet</b> in the controller and scan there.</p>
+        </div>
+        <div class="pair-step">
+          <span class="step-n">2</span>
+          <video class="pair-video mirror"></video>
+          <p>Hold the code the iPhone shows up to this camera.</p>
+        </div>
+      </div>
+      <p class="pair-msg" id="pair-msg"></p>
+      <button class="pair-cancel">Close</button>
+    </div>`
+  document.body.appendChild(overlay)
+  overlay.querySelector('.pair-cancel')!.addEventListener('click', () => closeOfflinePairing())
+  const msg = (text: string) => {
+    const el = document.getElementById('pair-msg')
+    if (el) el.textContent = text
+  }
+
+  // Camera first: while it's on, Safari puts the iPad's real local IP into
+  // the offer instead of an anonymised name, so the phone can reach it.
+  const scanner = new QrScanner(overlay.querySelector('video')!)
+  offerScanner = scanner
+  let session: OfferSession | null = null
+  const camOk = await scanner.start('user', (text) => {
+    if (!session) return
+    void session.accept(text).then((ok) => {
+      if (ok) msg('Connecting…')
+    })
+  })
+  if (!document.body.contains(overlay)) return scanner.stop()
+  if (!camOk) msg('Camera unavailable — allow camera access for this site in Settings to finish pairing.')
+
+  session = await createOfferSession(remote.consoleId)
+  if (!document.body.contains(overlay)) return session.cancel()
+  offerSession = session
+  remote.accept(session.link)
+  session.link.onOpen(() => {
+    if (offerSession === session) offerSession = null
+    closeOfflinePairing()
+  })
+  const qr = qrcode(0, 'M')
+  qr.addData(session.url)
+  qr.make()
+  const box = document.getElementById('offer-qr')!
+  box.innerHTML = qr.createSvgTag({ cellSize: 4, margin: 4, scalable: true })
+  box.dataset.url = session.url
+}
+
+function closeOfflinePairing(): void {
+  offerScanner?.stop()
+  offerScanner = null
+  offerSession?.cancel()
+  offerSession = null
+  document.getElementById('offline-pair')?.remove()
+}
 remote.onPhoneConnected = (n) => toast(`Phone connected — Player ${n}`)
 remote.onPhoneDisconnected = (n) => toast(`Player ${n} phone disconnected`)
 

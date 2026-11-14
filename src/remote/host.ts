@@ -1,4 +1,5 @@
-import { Peer, type DataConnection } from 'peerjs'
+import { Peer } from 'peerjs'
+import { peerLink, type PadLink } from './link'
 import { BUTTON_COUNT, PAD_PARAM, VIRTUAL_PAD_ID, peerOptions, type ConsoleMessage, type PhoneMessage } from './protocol'
 
 const ID_STORAGE_KEY = 'snes-remote-console-id'
@@ -10,7 +11,7 @@ const STALE_DROP_MS = 8000
 export type HostStatus = 'starting' | 'ready' | 'offline'
 
 interface VirtualPad {
-  conn: DataConnection
+  link: PadLink
   drop: () => void
   mask: number
   timestamp: number
@@ -66,7 +67,7 @@ export class RemoteHost {
     for (const pad of [...this.pads]) {
       const silent = now - pad.timestamp
       if (silent > STALE_DROP_MS) {
-        pad.conn.close()
+        pad.link.close()
         pad.drop()
       } else if (silent > STALE_RELEASE_MS) pad.mask = 0
     }
@@ -95,7 +96,7 @@ export class RemoteHost {
       saveId(id)
       this.setStatus('ready')
     })
-    peer.on('connection', (conn) => this.accept(conn))
+    peer.on('connection', (conn) => this.accept(peerLink(conn)))
     peer.on('disconnected', () => {
       this.setStatus('offline')
       this.scheduleBrokerRetry(2000)
@@ -136,17 +137,24 @@ export class RemoteHost {
     if (this.status !== 'ready') this.scheduleBrokerRetry(5000)
   }
 
-  private accept(conn: DataConnection): void {
-    const pad: VirtualPad = { conn, drop: () => undefined, mask: 0, timestamp: performance.now() }
-    conn.on('open', () => {
+  /** The id phones use to find this console through the broker. */
+  get consoleId(): string {
+    return this.id
+  }
+
+  /** Attach a phone, however it was paired (broker or offline QR swap). */
+  accept(link: PadLink): void {
+    const pad: VirtualPad = { link, drop: () => undefined, mask: 0, timestamp: performance.now() }
+    link.onOpen(() => {
+      pad.timestamp = performance.now()
       this.pads.push(pad)
       const player = this.playerOf(pad)
       const hello: ConsoleMessage = { t: 'hello', player }
-      void conn.send(hello)
+      link.send(hello)
       this.onPhoneConnected?.(player)
       this.onChange?.()
     })
-    conn.on('data', (raw) => {
+    link.onData((raw) => {
       const msg = raw as PhoneMessage
       if (msg && msg.t === 'in' && typeof msg.m === 'number') {
         pad.mask = msg.m
@@ -162,8 +170,7 @@ export class RemoteHost {
       this.onChange?.()
     }
     pad.drop = drop
-    conn.on('close', drop)
-    conn.on('error', drop)
+    link.onClose(drop)
   }
 
   private setStatus(status: HostStatus): void {
