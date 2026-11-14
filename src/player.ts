@@ -51,7 +51,9 @@ export class Player {
       this.comboRafId = requestAnimationFrame(poll)
       let pressed = false
       for (const pad of navigator.getGamepads?.() ?? []) {
-        if (pad?.connected && !!pad.buttons[8]?.pressed && !!pad.buttons[9]?.pressed) {
+        if (!pad?.connected) continue
+        // Start+Select, or the phone controller's dedicated Menu button (16).
+        if ((!!pad.buttons[8]?.pressed && !!pad.buttons[9]?.pressed) || !!pad.buttons[16]?.pressed) {
           pressed = true
           break
         }

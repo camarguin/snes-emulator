@@ -1,3 +1,5 @@
+import { VIRTUAL_PAD_ID } from './remote/protocol'
+
 export type MenuAction = 'up' | 'down' | 'left' | 'right' | 'select' | 'back'
 
 type ActionListener = (action: MenuAction) => void
@@ -74,8 +76,11 @@ export class MenuInput {
       if (btn(13) || ax(1) > 0.5) active.add('down')
       if (btn(14) || ax(0) < -0.5) active.add('left')
       if (btn(15) || ax(0) > 0.5) active.add('right')
-      if (btn(0)) active.add('select')
-      if (btn(1)) active.add('back')
+      // Phone pads are laid out like a SNES pad, so use Nintendo convention
+      // there (A = confirm, B = back); Xbox-style pads keep bottom = confirm.
+      const nintendo = pad.id === VIRTUAL_PAD_ID
+      if (btn(nintendo ? 1 : 0) || btn(9)) active.add('select')
+      if (btn(nintendo ? 0 : 1)) active.add('back')
     }
 
     for (const action of active) {

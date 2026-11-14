@@ -4,6 +4,10 @@ import { fetchLibrary, fetchRom, type GameEntry } from './library'
 import { exitFullscreen, Player, requestFullscreen } from './player'
 import { getSaveState, putSaveState } from './db'
 import { ROM_REPO } from './config'
+import qrcode from 'qrcode-generator'
+import { RemoteHost } from './remote/host'
+import { runController } from './remote/controller'
+import { PAD_PARAM } from './remote/protocol'
 
 const app = document.querySelector<HTMLDivElement>('#app')!
 
@@ -17,6 +21,7 @@ let hasSaveState = false
 
 const menuInput = new MenuInput()
 const player = new Player()
+const remote = new RemoteHost()
 
 function render(): void {
   if (screen === 'library') {
@@ -45,10 +50,11 @@ function renderLibrary(): void {
         <p class="repo">${ROM_REPO.owner}/${ROM_REPO.repo}</p>
       </header>
       ${body}
+      ${phoneCard()}
       <footer>
-        <span>A / Enter — Play</span>
+        <span>Tap / A / Enter — Play</span>
         <span>D-pad — Browse</span>
-        <span>In game: Start+Select — Menu</span>
+        <span>In game: Start+Select (or MENU on phone) — Menu</span>
       </footer>
     </div>`
 }
@@ -57,7 +63,7 @@ app.addEventListener('click', (e) => {
   const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('button.game')
   if (!btn) return
   const index = Number(btn.dataset.index)
-  if (!Number.isNaN(index)) void playGame(games[index])
+  if (!Number.isNaN(index)) void playGame(games[index], true)
 })
 
 // ------------------------------------------------------------ loading state
@@ -83,7 +89,50 @@ function showError(message: string): void {
 
 // ---------------------------------------------------------------- game view
 
-async function playGame(game: GameEntry): Promise<void> {
+// ------------------------------------------------------- phone controller
+
+let qrSvgCache: { url: string; svg: string } | null = null
+
+function qrSvg(url: string): string {
+  if (qrSvgCache?.url !== url) {
+    const qr = qrcode(0, 'M')
+    qr.addData(url)
+    qr.make()
+    qrSvgCache = { url, svg: qr.createSvgTag({ cellSize: 4, margin: 2, scalable: true }) }
+  }
+  return qrSvgCache.svg
+}
+
+function phoneStatusText(): string {
+  if (remote.phoneCount > 0) return remote.phoneCount === 1 ? '1 phone connected' : `${remote.phoneCount} phones connected`
+  if (remote.status === 'ready') return 'Waiting for a phone…'
+  if (remote.status === 'offline') return 'Offline — retrying…'
+  return 'Starting…'
+}
+
+function phoneCard(): string {
+  const ready = remote.status !== 'starting'
+  return `
+    <section class="phone-card" id="phone-card">
+      <div class="qr">${ready ? qrSvg(remote.controllerUrl) : ''}</div>
+      <div class="phone-text">
+        <h2>Use your iPhone as a controller</h2>
+        <p>Open the Camera on your iPhone, scan this code and tap the link. Scan with a second phone for Player 2.</p>
+        <p class="phone-status${remote.phoneCount > 0 ? ' ok' : ''}">${phoneStatusText()}</p>
+      </div>
+    </section>`
+}
+
+function refreshPhoneCard(): void {
+  const card = document.getElementById('phone-card')
+  if (card) card.outerHTML = phoneCard()
+}
+
+remote.onChange = () => refreshPhoneCard()
+remote.onPhoneConnected = (n) => toast(`Phone connected — Player ${n}`)
+remote.onPhoneDisconnected = (n) => toast(`Player ${n} phone disconnected`)
+
+async function playGame(game: GameEntry, fromTouch = false): Promise<void> {
   if (screen !== 'library') return
   screen = 'loading'
   showLoading(game.title)
@@ -105,6 +154,11 @@ async function playGame(game: GameEntry): Promise<void> {
     requestFullscreen()
     await player.launch(game, romBytes, canvas)
     player.onPauseToggle = () => togglePause()
+    // Started from a phone: iPadOS keeps audio muted until the screen itself
+    // is touched once.
+    if (!fromTouch && remote.phoneCount > 0 && /iPad|iPhone|Macintosh/.test(navigator.userAgent) && 'ontouchend' in document) {
+      toast('Tap the iPad screen once to turn on sound')
+    }
   } catch (err) {
     player.exit()
     showError(err instanceof Error ? err.message : String(err))
@@ -165,6 +219,7 @@ function renderPauseOverlay(): void {
           .join('\n')}
       </ul>
       <p class="hint">A — Select · B — Resume</p>
+      ${phoneCard()}
     </div>`
   app.appendChild(overlay)
 
@@ -309,7 +364,13 @@ async function boot(): Promise<void> {
   startMenuNav(libraryNav)
 }
 
-void boot()
+const padTarget = new URLSearchParams(window.location.search).get(PAD_PARAM)
+if (padTarget) {
+  runController(app, padTarget)
+} else {
+  remote.start()
+  void boot()
+}
 
 window.addEventListener('gamepadconnected', () => {
   if (screen === 'library' && games.length > 0) toast('Controller connected')
