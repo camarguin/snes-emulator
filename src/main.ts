@@ -2,12 +2,13 @@ import './style.css'
 import { MenuInput, type MenuAction } from './input'
 import { fetchLibrary, fetchRom, type GameEntry } from './library'
 import { exitFullscreen, Player, requestFullscreen } from './player'
-import { getSaveState, putSaveState } from './db'
+import { getSaveState, listCachedRoms, putSaveState } from './db'
 import { ROM_REPO } from './config'
 import qrcode from 'qrcode-generator'
 import { RemoteHost } from './remote/host'
 import { runController } from './remote/controller'
 import { PAD_PARAM } from './remote/protocol'
+import { createOfferSession, QrScanner, type OfferSession } from './remote/offline'
 
 const app = document.querySelector<HTMLDivElement>('#app')!
 
@@ -15,6 +16,8 @@ type Screen = 'library' | 'loading' | 'game'
 
 let screen: Screen = 'library'
 let games: GameEntry[] = []
+let libraryOffline = false
+let cachedRoms = new Set<string>()
 let focusedIndex = 0
 let currentGame: GameEntry | null = null
 let hasSaveState = false
@@ -35,7 +38,12 @@ function render(): void {
 
 function renderLibrary(): void {
   const items = games
-    .map((g, i) => `<li><button class="game${i === focusedIndex ? ' focused' : ''}" data-index="${i}">${escapeHtml(g.title)}</button></li>`)
+    .map((g, i) => {
+      const saved = cachedRoms.has(g.file)
+      const cls = `game${i === focusedIndex ? ' focused' : ''}${libraryOffline && !saved ? ' unavailable' : ''}`
+      const badge = saved ? `<span class="badge">Offline ready</span>` : ''
+      return `<li><button class="${cls}" data-index="${i}"><span class="title">${escapeHtml(g.title)}</span>${badge}</button></li>`
+    })
     .join('\n')
 
   const body =
@@ -49,6 +57,7 @@ function renderLibrary(): void {
         <h1>SNES</h1>
         <p class="repo">${ROM_REPO.owner}/${ROM_REPO.repo}</p>
       </header>
+      ${libraryOffline ? `<p class="offline-note">No internet — games marked “Offline ready” can still be played.</p>` : ''}
       ${body}
       ${phoneCard()}
       <footer>
@@ -104,9 +113,12 @@ function qrSvg(url: string): string {
 }
 
 function phoneStatusText(): string {
-  if (remote.phoneCount > 0) return remote.phoneCount === 1 ? '1 phone connected' : `${remote.phoneCount} phones connected`
+  if (remote.phoneCount > 0) {
+    const n = remote.phoneCount === 1 ? '1 phone connected' : `${remote.phoneCount} phones connected`
+    return remote.status === 'offline' ? `${n} · no internet, controller still works` : n
+  }
   if (remote.status === 'ready') return 'Waiting for a phone…'
-  if (remote.status === 'offline') return 'Offline — retrying…'
+  if (remote.status === 'offline') return 'No internet — new phones can’t pair until it’s back'
   return 'Starting…'
 }
 
@@ -119,6 +131,7 @@ function phoneCard(): string {
         <h2>Use your iPhone as a controller</h2>
         <p>Open the Camera on your iPhone, scan this code and tap the link. Scan with a second phone for Player 2.</p>
         <p class="phone-status${remote.phoneCount > 0 ? ' ok' : ''}">${phoneStatusText()}</p>
+        <button class="pair-offline-btn${remote.status === 'offline' ? ' urgent' : ''}" data-action="pair-offline">No internet? Pair without internet</button>
       </div>
     </section>`
 }
@@ -129,6 +142,87 @@ function refreshPhoneCard(): void {
 }
 
 remote.onChange = () => refreshPhoneCard()
+
+// ------------------------------------------------- offline (QR) pairing
+
+let offerSession: OfferSession | null = null
+let offerScanner: QrScanner | null = null
+
+document.addEventListener('click', (e) => {
+  if ((e.target as HTMLElement).closest('[data-action="pair-offline"]')) void openOfflinePairing()
+})
+
+/**
+ * iPad side of serverless pairing: show an offer QR for the phone and watch
+ * the front camera for the phone's answer QR.
+ */
+async function openOfflinePairing(): Promise<void> {
+  closeOfflinePairing()
+  const overlay = document.createElement('div')
+  overlay.id = 'offline-pair'
+  overlay.innerHTML = `
+    <div class="pair-box wide">
+      <h2>Pair without internet</h2>
+      <p class="lead">Both devices must be on the same network — the iPhone’s <b>Personal Hotspot</b> works best.</p>
+      <div class="pair-steps">
+        <div class="pair-step">
+          <span class="step-n">1</span>
+          <div class="pair-qr" id="offer-qr"><div class="spinner"></div></div>
+          <p>Scan with the iPhone Camera, or tap <b>Pair without internet</b> in the controller and scan there.</p>
+        </div>
+        <div class="pair-step">
+          <span class="step-n">2</span>
+          <video class="pair-video mirror"></video>
+          <p>Hold the code the iPhone shows up to this camera.</p>
+        </div>
+      </div>
+      <p class="pair-msg" id="pair-msg"></p>
+      <button class="pair-cancel">Close</button>
+    </div>`
+  document.body.appendChild(overlay)
+  overlay.querySelector('.pair-cancel')!.addEventListener('click', () => closeOfflinePairing())
+  const msg = (text: string) => {
+    const el = document.getElementById('pair-msg')
+    if (el) el.textContent = text
+  }
+
+  // Camera first: while it's on, Safari puts the iPad's real local IP into
+  // the offer instead of an anonymised name, so the phone can reach it.
+  const scanner = new QrScanner(overlay.querySelector('video')!)
+  offerScanner = scanner
+  let session: OfferSession | null = null
+  const camOk = await scanner.start('user', (text) => {
+    if (!session) return
+    void session.accept(text).then((ok) => {
+      if (ok) msg('Connecting…')
+    })
+  })
+  if (!document.body.contains(overlay)) return scanner.stop()
+  if (!camOk) msg('Camera unavailable — allow camera access for this site in Settings to finish pairing.')
+
+  session = await createOfferSession(remote.consoleId)
+  if (!document.body.contains(overlay)) return session.cancel()
+  offerSession = session
+  remote.accept(session.link)
+  session.link.onOpen(() => {
+    if (offerSession === session) offerSession = null
+    closeOfflinePairing()
+  })
+  const qr = qrcode(0, 'M')
+  qr.addData(session.url)
+  qr.make()
+  const box = document.getElementById('offer-qr')!
+  box.innerHTML = qr.createSvgTag({ cellSize: 4, margin: 4, scalable: true })
+  box.dataset.url = session.url
+}
+
+function closeOfflinePairing(): void {
+  offerScanner?.stop()
+  offerScanner = null
+  offerSession?.cancel()
+  offerSession = null
+  document.getElementById('offline-pair')?.remove()
+}
 remote.onPhoneConnected = (n) => toast(`Phone connected — Player ${n}`)
 remote.onPhoneDisconnected = (n) => toast(`Player ${n} phone disconnected`)
 
@@ -142,6 +236,7 @@ async function playGame(game: GameEntry, fromTouch = false): Promise<void> {
       if (el && total > 0) el.textContent = `Downloading… ${(loaded / 1e6).toFixed(1)} / ${(total / 1e6).toFixed(1)} MB`
     })
 
+    cachedRoms.add(game.file)
     const canvas = document.createElement('canvas')
     canvas.id = 'screen'
     app.innerHTML = ''
@@ -161,7 +256,14 @@ async function playGame(game: GameEntry, fromTouch = false): Promise<void> {
     }
   } catch (err) {
     player.exit()
-    showError(err instanceof Error ? err.message : String(err))
+    const offline = !navigator.onLine || err instanceof TypeError
+    showError(
+      offline && !cachedRoms.has(game.file)
+        ? `No internet, and “${game.title}” hasn’t been downloaded yet.\nPlay it once while you have signal and it will work offline after that.`
+        : err instanceof Error
+          ? err.message
+          : String(err),
+    )
   }
 }
 
@@ -348,7 +450,10 @@ async function boot(): Promise<void> {
   const status = document.getElementById('load-status')
   if (status) status.textContent = 'Fetching game library…'
   try {
-    games = await fetchLibrary()
+    const lib = await fetchLibrary()
+    games = lib.games
+    libraryOffline = lib.offline
+    cachedRoms = await listCachedRoms()
   } catch (err) {
     showError(
       `${err instanceof Error ? err.message : String(err)}\n\n` +
@@ -370,6 +475,27 @@ if (padTarget) {
 } else {
   remote.start()
   void boot()
+}
+
+registerServiceWorker()
+
+function registerServiceWorker(): void {
+  if (!('serviceWorker' in navigator) || import.meta.env.DEV) return
+  window.addEventListener('load', () => {
+    navigator.serviceWorker
+      .register('./sw.js')
+      .then(async () => {
+        const reg = await navigator.serviceWorker.ready
+        // Hand over everything this page pulled in (incl. lazy chunks), so a
+        // later launch with no signal finds it all in the cache.
+        const sameOrigin = performance
+          .getEntriesByType('resource')
+          .map((e) => e.name)
+          .filter((u) => u.startsWith(window.location.origin))
+        reg.active?.postMessage({ type: 'cache-urls', urls: sameOrigin })
+      })
+      .catch(() => undefined)
+  })
 }
 
 window.addEventListener('gamepadconnected', () => {

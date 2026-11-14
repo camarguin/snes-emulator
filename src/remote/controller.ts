@@ -1,4 +1,7 @@
-import { Peer, type DataConnection } from 'peerjs'
+import { Peer } from 'peerjs'
+import qrcode from 'qrcode-generator'
+import { peerLink, type PadLink } from './link'
+import { answerOffer, extractOfferCode, OFFLINE_HASH, QrScanner } from './offline'
 import { BTN, peerOptions, type ConsoleMessage, type PhoneMessage } from './protocol'
 
 const RETRY_MS = 1500
@@ -11,11 +14,20 @@ const KEEPALIVE_MS = 1000
  */
 export function runController(root: HTMLElement, consoleId: string): void {
   document.body.classList.add('controller-mode')
+  // "Add to Home Screen" from this page should reopen *this* controller, not
+  // the console. Without a manifest, iOS bookmarks the current URL (which
+  // carries the iPad's id) and still opens it full screen.
+  document.querySelector('link[rel="manifest"]')?.remove()
+  document.title = 'SNES Pad'
+  document.querySelector('meta[name="apple-mobile-web-app-title"]')?.setAttribute('content', 'SNES Pad')
   root.innerHTML = `
     <div class="pad">
       <div class="pad-row pad-top">
         <div class="shoulder" data-btn="${BTN.L}">L</div>
-        <div class="pad-status" id="pad-status">Connecting…</div>
+        <div class="pad-status-wrap">
+          <div class="pad-status" id="pad-status">Connecting…</div>
+          <div class="pill pair-offline" data-action="pair-offline">PAIR WITHOUT INTERNET</div>
+        </div>
         <div class="shoulder" data-btn="${BTN.R}">R</div>
       </div>
       <div class="pad-row pad-main">
@@ -41,6 +53,7 @@ export function runController(root: HTMLElement, consoleId: string): void {
     </div>`
 
   const statusEl = root.querySelector<HTMLElement>('#pad-status')!
+  const padEl = root.querySelector<HTMLElement>('.pad')!
   const dpad = root.querySelector<HTMLElement>('#dpad')!
   const face = root.querySelector<HTMLElement>('#face')!
   const faceBtns = Array.from(face.querySelectorAll<HTMLElement>('[data-face]'))
@@ -93,6 +106,11 @@ export function runController(root: HTMLElement, consoleId: string): void {
     e.preventDefault()
     if (e.type === 'touchstart') {
       requestWakeLock()
+      const t0 = e.changedTouches[0]
+      if (t0 && document.elementFromPoint(t0.clientX, t0.clientY)?.closest('[data-action="pair-offline"]')) {
+        void openOfflinePairing()
+        return
+      }
       for (const t of Array.from(e.changedTouches)) {
         if (document.elementFromPoint(t.clientX, t.clientY)?.closest('#dpad')) dpadTouches.add(t.identifier)
       }
@@ -123,65 +141,207 @@ export function runController(root: HTMLElement, consoleId: string): void {
 
   // ------------------------------------------------------------- connection
 
-  let conn: DataConnection | null = null
+  let conn: PadLink | null = null
   let retryTimer = 0
 
   const send = (): void => {
     if (!conn?.open) return
     const msg: PhoneMessage = { t: 'in', m: mask }
-    void conn.send(msg)
+    conn.send(msg)
   }
 
   const setStatus = (text: string, state: 'wait' | 'ok' | 'bad'): void => {
     statusEl.textContent = text
     statusEl.dataset.state = state
+    padEl.classList.toggle('linked', state === 'ok')
   }
 
-  const peer = new Peer(peerOptions())
-
-  const connect = (): void => {
-    window.clearTimeout(retryTimer)
-    if (peer.destroyed) return
-    if (peer.disconnected) {
-      peer.reconnect()
-      return
-    }
-    conn?.close()
-    const c = peer.connect(consoleId, { reliable: true, serialization: 'json' })
-    conn = c
-    c.on('open', () => {
+  /** Make `link` the active channel to the console. */
+  const adopt = (link: PadLink, onOpened?: () => void): void => {
+    conn = link
+    link.onOpen(() => {
+      if (conn !== link) return link.close()
       setStatus('Connected', 'ok')
+      onOpened?.()
       send()
     })
-    c.on('data', (raw) => {
+    link.onData((raw) => {
       const msg = raw as ConsoleMessage
-      if (msg?.t === 'hello') setStatus(`Player ${msg.player}`, 'ok')
+      if (conn === link && msg?.t === 'hello') setStatus(`Player ${msg.player}`, 'ok')
     })
-    const lost = () => {
-      if (conn !== c) return
+    link.onClose(() => {
+      if (conn !== link) return
+      connecting = false
+      offlinePairing = false
       conn = null
       setStatus('Reconnecting…', 'bad')
-      retryTimer = window.setTimeout(connect, RETRY_MS)
-    }
-    c.on('close', lost)
-    c.on('error', lost)
+      window.clearTimeout(retryTimer)
+      retryTimer = window.setTimeout(watchdog, RETRY_MS)
+    })
   }
 
-  peer.on('open', () => connect())
-  peer.on('disconnected', () => {
-    setStatus('Reconnecting…', 'bad')
-    window.setTimeout(() => !peer.destroyed && peer.reconnect(), RETRY_MS)
-  })
-  peer.on('error', (err) => {
-    const type = (err as { type?: string }).type
-    if (type === 'peer-unavailable') {
-      setStatus('Console not found — is the emulator open on the iPad?', 'bad')
-      conn = null
-      retryTimer = window.setTimeout(connect, RETRY_MS * 2)
-    } else if (type === 'network' || type === 'server-error' || type === 'socket-error' || type === 'socket-closed') {
-      setStatus('No connection — retrying…', 'bad')
+  // The broker only introduces us to the console; once a channel is open,
+  // button presses go straight to the iPad and survive the broker (or the
+  // internet) dropping out. So: never touch a working channel, and keep a
+  // single watchdog that repairs whichever part is down.
+  let peer = new Peer(peerOptions())
+  let peerEverOpened = false
+  let connecting = false
+  /** An offline (QR) pairing is in progress: leave `conn` alone. */
+  let offlinePairing = false
+
+  const wirePeer = (p: Peer): void => {
+    p.on('open', () => {
+      peerEverOpened = true
+      if (!conn?.open) connect()
+    })
+    p.on('disconnected', () => {
+      if (!conn?.open) setStatus('Reconnecting…', 'bad')
+    })
+    p.on('error', (err) => {
+      const type = (err as { type?: string }).type
+      if (offlinePairing || conn?.open) return
+      if (type === 'peer-unavailable') {
+        connecting = false
+        conn = null
+        setStatus('Console not found — is the emulator open on the iPad?', 'bad')
+      } else {
+        setStatus('No internet — retrying…', 'bad')
+      }
+    })
+  }
+  wirePeer(peer)
+
+  const connect = (): void => {
+    if (offlinePairing || peer.destroyed || peer.disconnected || !peer.open || connecting) return
+    connecting = true
+    const link = peerLink(peer.connect(consoleId, { reliable: true, serialization: 'json' }))
+    adopt(link, () => {
+      connecting = false
+    })
+    // A connect attempt that never opens (no route yet) is abandoned.
+    window.setTimeout(() => {
+      if (conn === link && !link.open) link.close()
+    }, 10000)
+  }
+
+  const watchdog = (): void => {
+    if (conn?.open || offlinePairing) return
+    if (peer.destroyed || (!peerEverOpened && peer.disconnected)) {
+      // Never reached the broker: start over with a fresh Peer.
+      peer.destroy()
+      peer = new Peer(peerOptions())
+      peerEverOpened = false
+      wirePeer(peer)
+    } else if (peer.disconnected) {
+      peer.reconnect()
+    } else {
+      connect()
     }
-  })
+  }
+  window.setInterval(watchdog, 3000)
+  window.addEventListener('online', watchdog)
+
+  // ------------------------------------------------- offline (QR) pairing
+
+  const overlay = document.createElement('div')
+  overlay.id = 'pair-overlay'
+  overlay.hidden = true
+  document.body.appendChild(overlay)
+  let scanner: QrScanner | null = null
+
+  const closeOverlay = (): void => {
+    scanner?.stop()
+    scanner = null
+    overlay.hidden = true
+    overlay.innerHTML = ''
+    if (offlinePairing && !conn?.open) {
+      conn?.close()
+      conn = null
+    }
+    offlinePairing = false
+    if (!conn?.open) watchdog()
+  }
+
+  const showOverlay = (html: string): void => {
+    overlay.innerHTML = `<div class="pair-box">${html}<button class="pair-cancel">Cancel</button></div>`
+    overlay.hidden = false
+    overlay.querySelector('.pair-cancel')!.addEventListener('click', closeOverlay)
+  }
+
+  /** Step 1 (in-app): scan the iPad's code with this phone's back camera. */
+  const openOfflinePairing = async (): Promise<void> => {
+    showOverlay(`
+      <h2>Pair without internet</h2>
+      <p>On the iPad, tap <b>Pair without internet</b>, then point this camera at the code it shows.</p>
+      <video class="pair-video"></video>
+      <p class="pair-msg"></p>`)
+    scanner = new QrScanner(overlay.querySelector('video')!)
+    let handled = false
+    const ok = await scanner.start('environment', (text) => {
+      if (handled) return
+      const code = extractOfferCode(text)
+      if (!code) {
+        overlay.querySelector('.pair-msg')!.textContent = 'That code isn’t from the iPad’s pairing screen.'
+        return
+      }
+      handled = true
+      void answer(code)
+    })
+    if (!ok) {
+      overlay.querySelector('.pair-msg')!.textContent =
+        'Camera unavailable. Instead, scan the iPad’s code with the iPhone Camera app.'
+    }
+  }
+
+  /** Step 2: answer the offer and show our code for the iPad's camera. */
+  const answer = async (offerCode: string): Promise<void> => {
+    offlinePairing = true
+    if (conn && !conn.open) conn.close()
+    // Answer while the camera is still on (Safari then exposes the real local IP).
+    const session = await answerOffer(offerCode)
+    scanner?.stop()
+    scanner = null
+    if (!session) {
+      offlinePairing = false
+      showOverlay(`<h2>Couldn’t read that code</h2><p>Open a fresh code on the iPad and try again.</p>`)
+      return
+    }
+    const qr = qrcode(0, 'M')
+    qr.addData(session.code)
+    qr.make()
+    showOverlay(`
+      <div class="pair-answer">
+        <div class="pair-qr">${qr.createSvgTag({ cellSize: 4, margin: 4, scalable: true })}</div>
+        <div>
+          <h2>Show this to the iPad</h2>
+          <p>Hold the iPhone screen up to the iPad’s front camera until it says connected.</p>
+          <p class="pair-msg">Waiting for the iPad…</p>
+        </div>
+      </div>`)
+    overlay.querySelector('.pair-qr')!.setAttribute('data-code', session.code)
+    adopt(session.link, () => {
+      offlinePairing = false
+      overlay.hidden = true
+      overlay.innerHTML = ''
+    })
+    // If the devices can't reach each other, say so instead of waiting forever.
+    window.setTimeout(() => {
+      if (conn === session.link && !session.link.open) {
+        const msg = overlay.querySelector('.pair-msg')
+        if (msg)
+          msg.textContent =
+            'Still not connected. Make sure both are on the same network — the iPhone’s Personal Hotspot works best; public Wi-Fi often blocks devices from seeing each other.'
+      }
+    }, 20000)
+  }
+
+  // Opened from the iPhone Camera app via the iPad's offline code.
+  const hashCode = new URLSearchParams(window.location.hash.replace(/^#/, '')).get(OFFLINE_HASH)
+  if (hashCode) {
+    history.replaceState(null, '', window.location.pathname + window.location.search)
+    void answer(hashCode)
+  }
 
   // Keepalive resend: recovers state if a message was ever missed.
   window.setInterval(send, KEEPALIVE_MS)
@@ -196,7 +356,7 @@ export function runController(root: HTMLElement, consoleId: string): void {
       setMask(0)
     } else {
       requestWakeLock()
-      if (!conn?.open) connect()
+      watchdog()
     }
   })
 }

@@ -1,4 +1,5 @@
-import { Peer, type DataConnection } from 'peerjs'
+import { Peer } from 'peerjs'
+import { peerLink, type PadLink } from './link'
 import { BUTTON_COUNT, PAD_PARAM, VIRTUAL_PAD_ID, peerOptions, type ConsoleMessage, type PhoneMessage } from './protocol'
 
 const ID_STORAGE_KEY = 'snes-remote-console-id'
@@ -10,7 +11,7 @@ const STALE_DROP_MS = 8000
 export type HostStatus = 'starting' | 'ready' | 'offline'
 
 interface VirtualPad {
-  conn: DataConnection
+  link: PadLink
   drop: () => void
   mask: number
   timestamp: number
@@ -53,6 +54,8 @@ export class RemoteHost {
     this.patchGamepads()
     this.connectBroker()
     window.setInterval(() => this.reapStale(), 1000)
+    // Coming out of a tunnel: don't wait for the next retry tick.
+    window.addEventListener('online', () => this.scheduleBrokerRetry(0))
   }
 
   /**
@@ -64,34 +67,43 @@ export class RemoteHost {
     for (const pad of [...this.pads]) {
       const silent = now - pad.timestamp
       if (silent > STALE_DROP_MS) {
-        pad.conn.close()
+        pad.link.close()
         pad.drop()
       } else if (silent > STALE_RELEASE_MS) pad.mask = 0
     }
   }
 
+  private retries = 0
+  private brokerTimer = 0
+  private everOpened = false
+
+  /**
+   * The broker is only needed to introduce new phones. Phones that are already
+   * paired talk to us directly, so a broker outage (a tunnel, a 5G dead spot)
+   * must never tear down the Peer: destroying it would close every data
+   * channel. Once we've been online we only ever call reconnect().
+   */
   private connectBroker(): void {
     this.peer?.destroy()
+    this.everOpened = false
     const peer = new Peer(this.id, peerOptions())
     this.peer = peer
 
     peer.on('open', (id) => {
       this.id = id
+      this.everOpened = true
+      this.retries = 0
       saveId(id)
       this.setStatus('ready')
     })
-    peer.on('connection', (conn) => this.accept(conn))
+    peer.on('connection', (conn) => this.accept(peerLink(conn)))
     peer.on('disconnected', () => {
-      // Lost the broker (not the phones): existing data channels keep working,
-      // we just can't accept new phones until we're back.
       this.setStatus('offline')
-      window.setTimeout(() => {
-        if (!peer.destroyed && peer.disconnected) peer.reconnect()
-      }, 2000)
+      this.scheduleBrokerRetry(2000)
     })
     peer.on('error', (err) => {
       const type = (err as { type?: string }).type
-      if (type === 'unavailable-id') {
+      if (type === 'unavailable-id' && !this.everOpened) {
         // Usually our own previous session still holding the id for a few
         // seconds after a reload; retry, then give up and take a new one.
         this.retries++
@@ -100,26 +112,49 @@ export class RemoteHost {
           this.retries = 0
         }
         window.setTimeout(() => this.connectBroker(), 2500)
-      } else if (type === 'network' || type === 'server-error' || type === 'socket-error' || type === 'socket-closed') {
+      } else if (type === 'network' || type === 'server-error' || type === 'socket-error' || type === 'socket-closed' || type === 'unavailable-id') {
         this.setStatus('offline')
-        window.setTimeout(() => this.connectBroker(), 4000)
+        this.scheduleBrokerRetry(4000)
       }
     })
   }
 
-  private retries = 0
+  private scheduleBrokerRetry(delay: number): void {
+    window.clearTimeout(this.brokerTimer)
+    this.brokerTimer = window.setTimeout(() => this.retryBroker(), delay)
+  }
 
-  private accept(conn: DataConnection): void {
-    const pad: VirtualPad = { conn, drop: () => undefined, mask: 0, timestamp: performance.now() }
-    conn.on('open', () => {
+  private retryBroker(): void {
+    const peer = this.peer
+    if (!peer || peer.destroyed) return this.connectBroker()
+    if (!this.everOpened) {
+      // Never got online, so no phones can be attached: a fresh start is safe.
+      if (this.pads.length === 0) return this.connectBroker()
+    } else if (peer.disconnected) {
+      peer.reconnect()
+    }
+    // Keep trying until the broker answers; 'open' resets the status.
+    if (this.status !== 'ready') this.scheduleBrokerRetry(5000)
+  }
+
+  /** The id phones use to find this console through the broker. */
+  get consoleId(): string {
+    return this.id
+  }
+
+  /** Attach a phone, however it was paired (broker or offline QR swap). */
+  accept(link: PadLink): void {
+    const pad: VirtualPad = { link, drop: () => undefined, mask: 0, timestamp: performance.now() }
+    link.onOpen(() => {
+      pad.timestamp = performance.now()
       this.pads.push(pad)
       const player = this.playerOf(pad)
       const hello: ConsoleMessage = { t: 'hello', player }
-      void conn.send(hello)
+      link.send(hello)
       this.onPhoneConnected?.(player)
       this.onChange?.()
     })
-    conn.on('data', (raw) => {
+    link.onData((raw) => {
       const msg = raw as PhoneMessage
       if (msg && msg.t === 'in' && typeof msg.m === 'number') {
         pad.mask = msg.m
@@ -135,8 +170,7 @@ export class RemoteHost {
       this.onChange?.()
     }
     pad.drop = drop
-    conn.on('close', drop)
-    conn.on('error', drop)
+    link.onClose(drop)
   }
 
   private setStatus(status: HostStatus): void {
