@@ -48,3 +48,13 @@ export function getSaveState(key: string): Promise<Uint8Array | null> {
 export function putSaveState(key: string, data: Uint8Array): Promise<void> {
   return withStore(STATES_STORE, 'readwrite', (s) => s.put(data, key)).then(() => undefined)
 }
+
+/** Files whose ROM bytes are already stored, i.e. playable with no internet. */
+export async function listCachedRoms(): Promise<Set<string>> {
+  try {
+    const keys = await withStore<IDBValidKey[]>(ROMS_STORE, 'readonly', (s) => s.getAllKeys())
+    return new Set(keys.map(String))
+  } catch {
+    return new Set()
+  }
+}

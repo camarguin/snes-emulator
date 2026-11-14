@@ -11,6 +11,12 @@ const KEEPALIVE_MS = 1000
  */
 export function runController(root: HTMLElement, consoleId: string): void {
   document.body.classList.add('controller-mode')
+  // "Add to Home Screen" from this page should reopen *this* controller, not
+  // the console. Without a manifest, iOS bookmarks the current URL (which
+  // carries the iPad's id) and still opens it full screen.
+  document.querySelector('link[rel="manifest"]')?.remove()
+  document.title = 'SNES Pad'
+  document.querySelector('meta[name="apple-mobile-web-app-title"]')?.setAttribute('content', 'SNES Pad')
   root.innerHTML = `
     <div class="pad">
       <div class="pad-row pad-top">
@@ -137,19 +143,42 @@ export function runController(root: HTMLElement, consoleId: string): void {
     statusEl.dataset.state = state
   }
 
-  const peer = new Peer(peerOptions())
+  // The broker only introduces us to the console; once the data channel is
+  // open, button presses go straight to the iPad and survive the broker (or
+  // the internet) dropping out. So: never touch a working channel, and keep
+  // a single watchdog that repairs whichever part is down.
+  let peer = new Peer(peerOptions())
+  let peerEverOpened = false
+  let connecting = false
+
+  const wirePeer = (p: Peer): void => {
+    p.on('open', () => {
+      peerEverOpened = true
+      if (!conn?.open) connect()
+    })
+    p.on('disconnected', () => {
+      if (!conn?.open) setStatus('Reconnecting…', 'bad')
+    })
+    p.on('error', (err) => {
+      const type = (err as { type?: string }).type
+      if (type === 'peer-unavailable') {
+        connecting = false
+        conn = null
+        setStatus('Console not found — is the emulator open on the iPad?', 'bad')
+      } else if (!conn?.open) {
+        setStatus('No internet — retrying…', 'bad')
+      }
+    })
+  }
+  wirePeer(peer)
 
   const connect = (): void => {
-    window.clearTimeout(retryTimer)
-    if (peer.destroyed) return
-    if (peer.disconnected) {
-      peer.reconnect()
-      return
-    }
-    conn?.close()
+    if (peer.destroyed || peer.disconnected || !peer.open || connecting) return
+    connecting = true
     const c = peer.connect(consoleId, { reliable: true, serialization: 'json' })
     conn = c
     c.on('open', () => {
+      connecting = false
       setStatus('Connected', 'ok')
       send()
     })
@@ -159,29 +188,39 @@ export function runController(root: HTMLElement, consoleId: string): void {
     })
     const lost = () => {
       if (conn !== c) return
+      connecting = false
       conn = null
       setStatus('Reconnecting…', 'bad')
-      retryTimer = window.setTimeout(connect, RETRY_MS)
+      window.clearTimeout(retryTimer)
+      retryTimer = window.setTimeout(watchdog, RETRY_MS)
     }
     c.on('close', lost)
     c.on('error', lost)
+    // A connect attempt that never opens (no route yet) is abandoned.
+    window.setTimeout(() => {
+      if (conn === c && !c.open) {
+        c.close()
+        lost()
+      }
+    }, 10000)
   }
 
-  peer.on('open', () => connect())
-  peer.on('disconnected', () => {
-    setStatus('Reconnecting…', 'bad')
-    window.setTimeout(() => !peer.destroyed && peer.reconnect(), RETRY_MS)
-  })
-  peer.on('error', (err) => {
-    const type = (err as { type?: string }).type
-    if (type === 'peer-unavailable') {
-      setStatus('Console not found — is the emulator open on the iPad?', 'bad')
-      conn = null
-      retryTimer = window.setTimeout(connect, RETRY_MS * 2)
-    } else if (type === 'network' || type === 'server-error' || type === 'socket-error' || type === 'socket-closed') {
-      setStatus('No connection — retrying…', 'bad')
+  const watchdog = (): void => {
+    if (conn?.open) return
+    if (peer.destroyed || (!peerEverOpened && peer.disconnected)) {
+      // Never reached the broker: start over with a fresh Peer.
+      peer.destroy()
+      peer = new Peer(peerOptions())
+      peerEverOpened = false
+      wirePeer(peer)
+    } else if (peer.disconnected) {
+      peer.reconnect()
+    } else {
+      connect()
     }
-  })
+  }
+  window.setInterval(watchdog, 3000)
+  window.addEventListener('online', watchdog)
 
   // Keepalive resend: recovers state if a message was ever missed.
   window.setInterval(send, KEEPALIVE_MS)
@@ -196,7 +235,7 @@ export function runController(root: HTMLElement, consoleId: string): void {
       setMask(0)
     } else {
       requestWakeLock()
-      if (!conn?.open) connect()
+      watchdog()
     }
   })
 }

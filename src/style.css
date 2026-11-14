@@ -484,3 +484,45 @@ body.controller-mode {
     min-width: 80px;
   }
 }
+
+/* ---------------------------------------------------------------- offline */
+
+.offline-note {
+  background: #2b2416;
+  border: 1px solid #5a4620;
+  color: #ffcf7a;
+  border-radius: 10px;
+  padding: 10px 14px;
+  font-size: 15px;
+}
+
+.game {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.game .title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.game .badge {
+  flex: none;
+  margin-left: auto;
+  font-size: 12px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  background: #16301f;
+  color: #5fd38a;
+}
+
+.game.unavailable {
+  opacity: 0.4;
+}
+
+/* Installed app: keep clear of the iPad's status bar / home indicator. */
+.library {
+  padding-top: max(clamp(24px, 6vh, 64px), env(safe-area-inset-top));
+  padding-bottom: max(clamp(24px, 6vh, 64px), env(safe-area-inset-bottom));
+}

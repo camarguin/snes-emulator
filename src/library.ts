@@ -15,14 +15,53 @@ function titleFromFile(file: string): string {
   return base.replace(/\.(sfc|smc|fig|swc)$/i, '').replace(/[_.]/g, ' ').trim()
 }
 
-export async function fetchLibrary(): Promise<GameEntry[]> {
-  const res = await fetch(manifestUrl(), { cache: 'no-store' })
-  if (!res.ok) throw new Error(`manifest.json not found in the ROM repo (HTTP ${res.status})`)
-  const data = (await res.json()) as ManifestFile | string[]
+const LIBRARY_CACHE_KEY = 'snes-library-cache'
+const LIBRARY_TIMEOUT_MS = 6000
+
+export interface Library {
+  games: GameEntry[]
+  /** True when the list came from the last good copy because the network failed. */
+  offline: boolean
+}
+
+/**
+ * The game list from the ROM repo, falling back to the last copy we saw so the
+ * installed app still opens with no (or a flaky) connection.
+ */
+export async function fetchLibrary(): Promise<Library> {
+  try {
+    const ctrl = new AbortController()
+    const timer = window.setTimeout(() => ctrl.abort(), LIBRARY_TIMEOUT_MS)
+    const res = await fetch(manifestUrl(), { cache: 'no-store', signal: ctrl.signal }).finally(() => window.clearTimeout(timer))
+    if (!res.ok) throw new Error(`manifest.json not found in the ROM repo (HTTP ${res.status})`)
+    const games = parseManifest((await res.json()) as ManifestFile | string[])
+    try {
+      localStorage.setItem(LIBRARY_CACHE_KEY, JSON.stringify(games))
+    } catch {
+      // best effort
+    }
+    return { games, offline: false }
+  } catch (err) {
+    const saved = loadSavedLibrary()
+    if (saved) return { games: saved, offline: true }
+    throw err instanceof DOMException && err.name === 'AbortError' ? new Error('No internet connection') : err
+  }
+}
+
+function parseManifest(data: ManifestFile | string[]): GameEntry[] {
   const games = Array.isArray(data) ? data : (data.games ?? [])
   return games.map((g) =>
     typeof g === 'string' ? { file: g, title: titleFromFile(g) } : { file: g.file, title: g.title ?? titleFromFile(g.file) },
   )
+}
+
+function loadSavedLibrary(): GameEntry[] | null {
+  try {
+    const raw = localStorage.getItem(LIBRARY_CACHE_KEY)
+    return raw ? (JSON.parse(raw) as GameEntry[]) : null
+  } catch {
+    return null
+  }
 }
 
 export async function fetchRom(game: GameEntry, onProgress: (loaded: number, total: number) => void): Promise<Uint8Array> {
