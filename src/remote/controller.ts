@@ -2,6 +2,7 @@ import { Peer } from 'peerjs'
 import qrcode from 'qrcode-generator'
 import { peerLink, type PadLink } from './link'
 import { answerOffer, describeAddresses, OFFLINE_HASH, parseScan, QrScanner, unreachableHint } from './offline'
+import { KeepAwake } from '../keepAwake'
 import { BTN, PAD_PARAM, peerOptions, type ConsoleMessage, type PhoneMessage } from './protocol'
 
 const RETRY_MS = 1500
@@ -32,6 +33,8 @@ const KEEPALIVE_MS = 1000
  */
 export function runController(root: HTMLElement, initialConsoleId: string | null): void {
   let consoleId = initialConsoleId
+  // A long cutscene means no touches; don't let the phone lock and drop the link.
+  new KeepAwake().set(true)
   if (consoleId) saveConsoleId(consoleId)
   document.body.classList.add('controller-mode')
   // "Add to Home Screen" from this page should reopen *this* controller, not
@@ -128,7 +131,6 @@ export function runController(root: HTMLElement, initialConsoleId: string | null
   const onTouch = (e: TouchEvent): void => {
     e.preventDefault()
     if (e.type === 'touchstart') {
-      requestWakeLock()
       const t0 = e.changedTouches[0]
       if (t0 && document.elementFromPoint(t0.clientX, t0.clientY)?.closest('[data-action="scan"]')) {
         void openScanner()
@@ -424,22 +426,7 @@ export function runController(root: HTMLElement, initialConsoleId: string | null
       dpadTouches.clear()
       setMask(0)
     } else {
-      requestWakeLock()
       watchdog()
     }
   })
-}
-
-// ------------------------------------------------------------------ wake lock
-
-let wakeLock: { released: boolean } | null = null
-
-function requestWakeLock(): void {
-  const wl = (navigator as Navigator & { wakeLock?: { request(type: 'screen'): Promise<{ released: boolean }> } }).wakeLock
-  if (!wl || (wakeLock && !wakeLock.released)) return
-  wl.request('screen')
-    .then((lock) => {
-      wakeLock = lock
-    })
-    .catch(() => undefined)
 }

@@ -6,6 +6,7 @@ import { getSaveState, listCachedRoms, putSaveState } from './db'
 import { ROM_REPO } from './config'
 import qrcode from 'qrcode-generator'
 import { RemoteHost } from './remote/host'
+import { KeepAwake } from './keepAwake'
 import { runController, savedConsoleId } from './remote/controller'
 import { PAD_PARAM } from './remote/protocol'
 import { createOfferSession, describeAddresses, QrScanner, unreachableHint, type OfferSession } from './remote/offline'
@@ -25,6 +26,12 @@ let hasSaveState = false
 const menuInput = new MenuInput()
 const player = new Player()
 const remote = new RemoteHost()
+const keepAwake = new KeepAwake()
+
+/** Screen stays on while playing, or while a phone is driving the menus. */
+function updateKeepAwake(): void {
+  keepAwake.set(screen === 'game' || remote.phoneCount > 0)
+}
 
 function render(): void {
   if (screen === 'library') {
@@ -142,7 +149,10 @@ function refreshPhoneCard(): void {
   if (card) card.outerHTML = phoneCard()
 }
 
-remote.onChange = () => refreshPhoneCard()
+remote.onChange = () => {
+  refreshPhoneCard()
+  updateKeepAwake()
+}
 
 // ------------------------------------------------- offline (QR) pairing
 
@@ -274,6 +284,7 @@ async function playGame(game: GameEntry, fromTouch = false): Promise<void> {
     app.innerHTML = ''
     app.appendChild(canvas)
     screen = 'game'
+    updateKeepAwake()
     currentGame = game
     hasSaveState = (await getSaveState(saveKey(game))) !== null
     stopMenuNav()
@@ -426,6 +437,7 @@ function exitToLibrary(): void {
   exitFullscreen()
   currentGame = null
   screen = 'library'
+  updateKeepAwake()
   render()
 }
 
