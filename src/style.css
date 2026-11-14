@@ -700,15 +700,84 @@ body.controller-mode {
   gap: 8px;
 }
 
-.pad .pair-offline {
+
+/* -------------------------------------------- controller: scan + diagnostics */
+
+.pad .scan-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   font-size: 11px;
   padding: 8px 12px;
   min-width: 0;
-  color: #ffcf7a;
-  border: 1px solid #5a4620;
-  background: transparent;
+  color: #0b0d12;
+  background: #ffcf7a;
 }
 
-.pad.linked .pair-offline {
-  display: none;
+.pad .scan-btn svg {
+  width: 16px;
+  height: 16px;
+}
+
+/* Once connected it stays available (to switch iPads) but steps back. */
+.pad.linked .scan-btn {
+  color: #aab1c2;
+  background: transparent;
+  border: 1px solid #3a4150;
+}
+
+.pair-diag {
+  font-size: 12px;
+  color: #6b7386 !important;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.use-as-pad {
+  display: block;
+  text-align: center;
+  padding: 14px;
+  border-radius: 12px;
+  background: #ffcf7a;
+  color: #0b0d12;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.pair-actions {
+  display: flex;
+  gap: 12px;
+}
+
+.pair-retry {
+  padding: 10px 28px;
+  border-radius: 999px;
+  background: #2a2f3c;
+}
+
+/* Phone scanner: camera beside the text, so it all fits a sideways phone. */
+.pair-scan {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  text-align: left;
+}
+
+#pair-overlay .pair-scan .pair-video {
+  width: min(62vh, 45vw);
+  flex: none;
+}
+
+#pair-overlay .pair-box {
+  padding: 14px 20px;
+  gap: 10px;
+}
+
+@media (orientation: portrait) {
+  .pair-scan {
+    flex-direction: column;
+    text-align: center;
+  }
+  #pair-overlay .pair-scan .pair-video {
+    width: min(80vw, 50vh);
+  }
 }

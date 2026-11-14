@@ -6,9 +6,9 @@ import { getSaveState, listCachedRoms, putSaveState } from './db'
 import { ROM_REPO } from './config'
 import qrcode from 'qrcode-generator'
 import { RemoteHost } from './remote/host'
-import { runController } from './remote/controller'
+import { runController, savedConsoleId } from './remote/controller'
 import { PAD_PARAM } from './remote/protocol'
-import { createOfferSession, QrScanner, type OfferSession } from './remote/offline'
+import { createOfferSession, describeAddresses, QrScanner, unreachableHint, type OfferSession } from './remote/offline'
 
 const app = document.querySelector<HTMLDivElement>('#app')!
 
@@ -57,6 +57,7 @@ function renderLibrary(): void {
         <h1>SNES</h1>
         <p class="repo">${ROM_REPO.owner}/${ROM_REPO.repo}</p>
       </header>
+      ${isPhone() ? `<a class="use-as-pad" href="?${PAD_PARAM}=scan">Use this phone as a controller</a>` : ''}
       ${libraryOffline ? `<p class="offline-note">No internet — games marked “Offline ready” can still be played.</p>` : ''}
       ${body}
       ${phoneCard()}
@@ -129,7 +130,7 @@ function phoneCard(): string {
       <div class="qr">${ready ? qrSvg(remote.controllerUrl) : ''}</div>
       <div class="phone-text">
         <h2>Use your iPhone as a controller</h2>
-        <p>Open the Camera on your iPhone, scan this code and tap the link. Scan with a second phone for Player 2.</p>
+        <p>On the iPhone, open the Camera (or tap <b>SCAN</b> in the controller app) and scan this code. Scan with a second phone for Player 2.</p>
         <p class="phone-status${remote.phoneCount > 0 ? ' ok' : ''}">${phoneStatusText()}</p>
         <button class="pair-offline-btn${remote.status === 'offline' ? ' urgent' : ''}" data-action="pair-offline">No internet? Pair without internet</button>
       </div>
@@ -168,22 +169,34 @@ async function openOfflinePairing(): Promise<void> {
         <div class="pair-step">
           <span class="step-n">1</span>
           <div class="pair-qr" id="offer-qr"><div class="spinner"></div></div>
-          <p>Scan with the iPhone Camera, or tap <b>Pair without internet</b> in the controller and scan there.</p>
+          <p>On the iPhone, tap <b>SCAN</b> in the controller (or use the Camera app) and point it here.</p>
         </div>
         <div class="pair-step">
           <span class="step-n">2</span>
           <video class="pair-video mirror"></video>
-          <p>Hold the code the iPhone shows up to this camera.</p>
+          <p>Then hold the code the iPhone shows up to this camera, 20–30 cm away.</p>
         </div>
       </div>
       <p class="pair-msg" id="pair-msg"></p>
-      <button class="pair-cancel">Close</button>
+      <p class="pair-diag" id="pair-diag"></p>
+      <div class="pair-actions">
+        <button class="pair-retry">Try again</button>
+        <button class="pair-cancel">Close</button>
+      </div>
     </div>`
   document.body.appendChild(overlay)
   overlay.querySelector('.pair-cancel')!.addEventListener('click', () => closeOfflinePairing())
+  overlay.querySelector('.pair-retry')!.addEventListener('click', () => void openOfflinePairing())
   const msg = (text: string) => {
     const el = document.getElementById('pair-msg')
     if (el) el.textContent = text
+  }
+  const diag = (s: OfferSession) => {
+    const el = document.getElementById('pair-diag')
+    if (el)
+      el.textContent =
+        `This iPad: ${describeAddresses(s.localAddrs)}` +
+        (s.remoteAddrs.length ? ` · iPhone: ${describeAddresses(s.remoteAddrs)}` : '')
   }
 
   // Camera first: while it's on, Safari puts the iPad's real local IP into
@@ -191,10 +204,24 @@ async function openOfflinePairing(): Promise<void> {
   const scanner = new QrScanner(overlay.querySelector('video')!)
   offerScanner = scanner
   let session: OfferSession | null = null
+  let answered = false
   const camOk = await scanner.start('user', (text) => {
-    if (!session) return
-    void session.accept(text).then((ok) => {
-      if (ok) msg('Connecting…')
+    const s = session
+    if (!s || answered) return
+    void s.accept(text).then((ok) => {
+      if (!ok) {
+        msg('That’s not the code from the iPhone’s pairing screen.')
+        return
+      }
+      if (answered) return
+      answered = true
+      msg('Got the iPhone’s code — connecting…')
+      diag(s)
+      // The camera stays on until we're connected: Safari only shares the
+      // real local address while capture is active.
+      window.setTimeout(() => {
+        if (offerSession === s && !s.link.open) msg(unreachableHint(s.localAddrs, s.remoteAddrs))
+      }, 15000)
     })
   })
   if (!document.body.contains(overlay)) return scanner.stop()
@@ -203,6 +230,11 @@ async function openOfflinePairing(): Promise<void> {
   session = await createOfferSession(remote.consoleId)
   if (!document.body.contains(overlay)) return session.cancel()
   offerSession = session
+  const live = session
+  diag(live)
+  live.onState((st) => {
+    if (st === 'failed' && offerSession === live) msg(unreachableHint(live.localAddrs, live.remoteAddrs))
+  })
   remote.accept(session.link)
   session.link.onOpen(() => {
     if (offerSession === session) offerSession = null
@@ -469,9 +501,13 @@ async function boot(): Promise<void> {
   startMenuNav(libraryNav)
 }
 
-const padTarget = new URLSearchParams(window.location.search).get(PAD_PARAM)
-if (padTarget) {
-  runController(app, padTarget)
+const padParam = new URLSearchParams(window.location.search).get(PAD_PARAM)
+if (padParam !== null) {
+  // `?pad=<id>` pairs with that iPad; `?pad=` (or `scan`) opens the scanner.
+  runController(app, padParam && padParam !== 'scan' ? padParam : savedConsoleId())
+} else if (isPhone() && isStandalone() && savedConsoleId()) {
+  // The iPhone's Home Screen app, after it has paired once: straight to the pad.
+  runController(app, savedConsoleId())
 } else {
   remote.start()
   void boot()
@@ -501,6 +537,14 @@ function registerServiceWorker(): void {
 window.addEventListener('gamepadconnected', () => {
   if (screen === 'library' && games.length > 0) toast('Controller connected')
 })
+
+function isPhone(): boolean {
+  return matchMedia('(pointer: coarse) and ((max-width: 600px) or (max-height: 500px))').matches
+}
+
+function isStandalone(): boolean {
+  return matchMedia('(display-mode: standalone), (display-mode: fullscreen)').matches || (navigator as Navigator & { standalone?: boolean }).standalone === true
+}
 
 function escapeHtml(text: string): string {
   const div = document.createElement('div')

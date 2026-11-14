@@ -77,6 +77,8 @@ function compact(kind: Kind, sdp: string): string | null {
   const fp = get(/^a=fingerprint:sha-256 ([0-9A-Fa-f:]+)/m)
   if (!ufrag || !pwd || !fp || /~/.test(ufrag + pwd)) return null
   if (get(/^a=mid:(\S+)/m) !== '0' || get(/^a=sctp-port:(\d+)/m) !== '5000') return null
+  // The template hard-codes the DTLS roles; anything else travels as full SDP.
+  if (get(/^a=setup:(\S+)/m) !== (kind === 'o' ? 'actpass' : 'active')) return null
   const fpBytes = Uint8Array.from(fp.split(':'), (h) => parseInt(h, 16))
   const cands: string[] = []
   for (const line of slimSdp(sdp).split('\r\n')) {
@@ -143,6 +145,28 @@ async function decode(kind: Kind, code: string): Promise<string | null> {
   }
 }
 
+export type ScanResult =
+  | { type: 'online'; consoleId: string }
+  | { type: 'offline'; offerCode: string; consoleId: string | null }
+
+/**
+ * Makes sense of anything the phone's camera read off the iPad: the normal
+ * pairing link (`?pad=<id>`), the offline one (`?pad=<id>#offline=<code>`),
+ * or a bare offline code.
+ */
+export function parseScan(text: string): ScanResult | null {
+  const offerCode = extractOfferCode(text)
+  let consoleId: string | null = null
+  try {
+    consoleId = new URL(text.trim()).searchParams.get(PAD_PARAM)
+  } catch {
+    // not a URL
+  }
+  if (offerCode) return { type: 'offline', offerCode, consoleId }
+  if (consoleId) return { type: 'online', consoleId }
+  return null
+}
+
 /** Pulls an offer code out of whatever was scanned: our link, or a bare code. */
 export function extractOfferCode(text: string): string | null {
   const trimmed = text.trim()
@@ -154,6 +178,34 @@ export function extractOfferCode(text: string): string | null {
   } catch {
     return null
   }
+}
+
+// ------------------------------------------------------------ diagnostics
+
+/** Candidate addresses in an SDP, e.g. ["172.20.10.2", "4f1c….local"]. */
+export function addressesOf(sdp: string | undefined | null): string[] {
+  if (!sdp) return []
+  const out = new Set<string>()
+  for (const line of sdp.split(/\r?\n/)) {
+    if (line.startsWith('a=candidate:')) out.add(line.split(' ')[4] ?? '?')
+  }
+  return [...out]
+}
+
+/** Short human form: real IPs as-is, Safari's anonymised names as "hidden". */
+export function describeAddresses(addrs: string[]): string {
+  if (!addrs.length) return 'no network address'
+  return addrs.map((a) => (a.endsWith('.local') ? 'hidden address' : a)).join(', ')
+}
+
+export type LinkState = 'new' | 'checking' | 'connected' | 'failed' | 'closed'
+
+function watchState(pc: RTCPeerConnection, cb: (s: LinkState) => void): void {
+  const report = () => {
+    const ice = pc.iceConnectionState
+    cb(ice === 'completed' ? 'connected' : ice === 'disconnected' ? 'checking' : (ice as LinkState))
+  }
+  pc.addEventListener('iceconnectionstatechange', report)
 }
 
 // --------------------------------------------------------------- sessions
@@ -183,6 +235,9 @@ export interface OfferSession {
   /** Link to put in the QR code; opening it on a phone starts pairing. */
   url: string
   link: PadLink
+  localAddrs: string[]
+  remoteAddrs: string[]
+  onState(cb: (s: LinkState) => void): void
   /** Feed it the phone's answer code; resolves false if it isn't one. */
   accept(answerCode: string): Promise<boolean>
   cancel(): void
@@ -201,14 +256,18 @@ export async function createOfferSession(consoleId: string): Promise<OfferSessio
   url.hash = `${OFFLINE_HASH}=${encodeURIComponent(code)}`
 
   let answered = false
-  return {
+  const session: OfferSession = {
     url: url.toString(),
     link: channelLink(pc, dc),
+    localAddrs: addressesOf(pc.localDescription!.sdp),
+    remoteAddrs: [],
+    onState: (cb) => watchState(pc, cb),
     async accept(answerCode) {
       if (answered) return true
       const sdp = await decode('a', answerCode)
       if (!sdp) return false
       answered = true
+      session.remoteAddrs = addressesOf(sdp)
       await pc.setRemoteDescription({ type: 'answer', sdp })
       return true
     },
@@ -219,12 +278,16 @@ export async function createOfferSession(consoleId: string): Promise<OfferSessio
       }
     },
   }
+  return session
 }
 
 export interface AnswerSession {
   /** Code to show as a QR for the console's camera. */
   code: string
   link: PadLink
+  localAddrs: string[]
+  remoteAddrs: string[]
+  onState(cb: (s: LinkState) => void): void
 }
 
 /** Phone side: answer a scanned offer. */
@@ -235,7 +298,13 @@ export async function answerOffer(offerCode: string): Promise<AnswerSession | nu
   await pc.setRemoteDescription({ type: 'offer', sdp })
   await pc.setLocalDescription(await pc.createAnswer())
   await gathered(pc)
-  return { code: await encode('a', pc.localDescription!.sdp), link: channelLink(pc, dc) }
+  return {
+    code: await encode('a', pc.localDescription!.sdp),
+    link: channelLink(pc, dc),
+    localAddrs: addressesOf(pc.localDescription!.sdp),
+    remoteAddrs: addressesOf(sdp),
+    onState: (cb) => watchState(pc, cb),
+  }
 }
 
 // ----------------------------------------------------------------- camera
@@ -261,7 +330,7 @@ export class QrScanner {
     this.stop()
     try {
       this.stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } },
+        video: { facingMode: facing, width: { ideal: 1920 }, height: { ideal: 1080 } },
         audio: false,
       })
     } catch {
@@ -270,15 +339,24 @@ export class QrScanner {
     this.video.srcObject = this.stream
     await this.video.play().catch(() => undefined)
     const ctx = this.canvas.getContext('2d', { willReadFrequently: true })!
+    let frame = 0
     const tick = () => {
-      this.timer = window.setTimeout(tick, 150)
+      this.timer = window.setTimeout(tick, 120)
       const w = this.video.videoWidth
       const h = this.video.videoHeight
       if (!w || !h) return
-      const scale = Math.min(1, 800 / w)
-      this.canvas.width = Math.round(w * scale)
-      this.canvas.height = Math.round(h * scale)
-      ctx.drawImage(this.video, 0, 0, this.canvas.width, this.canvas.height)
+      // Alternate between the whole frame (downscaled) and the middle half at
+      // full resolution: a code held at arm's length is small in a wide
+      // front-camera frame and only resolves in the zoomed crop.
+      const zoom = frame++ % 2 === 1
+      const sx = zoom ? w / 4 : 0
+      const sy = zoom ? h / 4 : 0
+      const sw = zoom ? w / 2 : w
+      const sh = zoom ? h / 2 : h
+      const scale = Math.min(1, 960 / sw)
+      this.canvas.width = Math.round(sw * scale)
+      this.canvas.height = Math.round(sh * scale)
+      ctx.drawImage(this.video, sx, sy, sw, sh, 0, 0, this.canvas.width, this.canvas.height)
       const img = ctx.getImageData(0, 0, this.canvas.width, this.canvas.height)
       const hit = jsQR(img.data, img.width, img.height, { inversionAttempts: 'dontInvert' })
       if (hit?.data) onCode(hit.data)
@@ -293,4 +371,19 @@ export class QrScanner {
     this.stream = null
     this.video.srcObject = null
   }
+}
+
+/** Best guess at why two devices couldn't connect, in plain words. */
+export function unreachableHint(mine: string[], theirs: string[]): string {
+  const v4 = (addrs: string[]) => addrs.filter((a) => /^\d+\.\d+\.\d+\.\d+$/.test(a))
+  const a = v4(mine)
+  const b = v4(theirs)
+  if (!a.length && !b.length) {
+    return 'Couldn’t connect, and both devices hid their network address. Allow camera access on both (it lets Safari share the local address) and try again.'
+  }
+  const subnet = (ip: string) => ip.split('.').slice(0, 3).join('.')
+  if (a.length && b.length && !a.some((x) => b.some((y) => subnet(x) === subnet(y)))) {
+    return `Couldn’t connect: the devices look like they’re on different networks (${a.join(', ')} vs ${b.join(', ')}). Join the iPad to the iPhone’s Personal Hotspot and try again.`
+  }
+  return 'Couldn’t connect. This network may stop devices from talking to each other (common on public Wi-Fi) — use the iPhone’s Personal Hotspot and try again.'
 }

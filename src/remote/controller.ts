@@ -1,10 +1,28 @@
 import { Peer } from 'peerjs'
 import qrcode from 'qrcode-generator'
 import { peerLink, type PadLink } from './link'
-import { answerOffer, extractOfferCode, OFFLINE_HASH, QrScanner } from './offline'
-import { BTN, peerOptions, type ConsoleMessage, type PhoneMessage } from './protocol'
+import { answerOffer, describeAddresses, OFFLINE_HASH, parseScan, QrScanner, unreachableHint } from './offline'
+import { BTN, PAD_PARAM, peerOptions, type ConsoleMessage, type PhoneMessage } from './protocol'
 
 const RETRY_MS = 1500
+/** The iPad this phone last paired with, so the Home Screen app finds it again. */
+export const SAVED_CONSOLE_KEY = 'snes-controller-console'
+
+export function savedConsoleId(): string | null {
+  try {
+    return localStorage.getItem(SAVED_CONSOLE_KEY)
+  } catch {
+    return null
+  }
+}
+
+function saveConsoleId(id: string): void {
+  try {
+    localStorage.setItem(SAVED_CONSOLE_KEY, id)
+  } catch {
+    // best effort
+  }
+}
 const KEEPALIVE_MS = 1000
 
 /**
@@ -12,7 +30,9 @@ const KEEPALIVE_MS = 1000
  * the console over a PeerJS data channel. Every touch is re-hit-tested on each
  * move, so thumbs can slide across the D-pad and between face buttons.
  */
-export function runController(root: HTMLElement, consoleId: string): void {
+export function runController(root: HTMLElement, initialConsoleId: string | null): void {
+  let consoleId = initialConsoleId
+  if (consoleId) saveConsoleId(consoleId)
   document.body.classList.add('controller-mode')
   // "Add to Home Screen" from this page should reopen *this* controller, not
   // the console. Without a manifest, iOS bookmarks the current URL (which
@@ -26,7 +46,10 @@ export function runController(root: HTMLElement, consoleId: string): void {
         <div class="shoulder" data-btn="${BTN.L}">L</div>
         <div class="pad-status-wrap">
           <div class="pad-status" id="pad-status">Connecting…</div>
-          <div class="pill pair-offline" data-action="pair-offline">PAIR WITHOUT INTERNET</div>
+          <div class="pill scan-btn" data-action="scan">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M9 3 7.2 5H4a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-3.2L15 3H9Zm3 5a4.5 4.5 0 1 1 0 9 4.5 4.5 0 0 1 0-9Zm0 2a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5Z"/></svg>
+            <span>SCAN iPad CODE</span>
+          </div>
         </div>
         <div class="shoulder" data-btn="${BTN.R}">R</div>
       </div>
@@ -107,8 +130,8 @@ export function runController(root: HTMLElement, consoleId: string): void {
     if (e.type === 'touchstart') {
       requestWakeLock()
       const t0 = e.changedTouches[0]
-      if (t0 && document.elementFromPoint(t0.clientX, t0.clientY)?.closest('[data-action="pair-offline"]')) {
-        void openOfflinePairing()
+      if (t0 && document.elementFromPoint(t0.clientX, t0.clientY)?.closest('[data-action="scan"]')) {
+        void openScanner()
         return
       }
       for (const t of Array.from(e.changedTouches)) {
@@ -213,6 +236,10 @@ export function runController(root: HTMLElement, consoleId: string): void {
   wirePeer(peer)
 
   const connect = (): void => {
+    if (!consoleId) {
+      setStatus('Tap SCAN and point at the code on the iPad', 'wait')
+      return
+    }
     if (offlinePairing || peer.destroyed || peer.disconnected || !peer.open || connecting) return
     connecting = true
     const link = peerLink(peer.connect(consoleId, { reliable: true, serialization: 'json' }))
@@ -269,29 +296,67 @@ export function runController(root: HTMLElement, consoleId: string): void {
     overlay.querySelector('.pair-cancel')!.addEventListener('click', closeOverlay)
   }
 
-  /** Step 1 (in-app): scan the iPad's code with this phone's back camera. */
-  const openOfflinePairing = async (): Promise<void> => {
+  /** Point this phone at another iPad (or the same one with a new id). */
+  const switchConsole = (id: string): void => {
+    saveConsoleId(id)
+    const url = new URL(window.location.href)
+    url.hash = ''
+    url.searchParams.set(PAD_PARAM, id)
+    history.replaceState(null, '', url.toString())
+    closeOverlay()
+    if (id === consoleId && conn?.open) return
+    consoleId = id
+    const old = conn
+    conn = null
+    connecting = false
+    old?.close()
+    setStatus('Connecting…', 'wait')
+    watchdog()
+  }
+
+  /**
+   * In-app camera (the iOS Camera app can't hand links to a Home Screen app).
+   * Reads either iPad code: the normal pairing one or the no-internet one.
+   */
+  const openScanner = async (): Promise<void> => {
     showOverlay(`
-      <h2>Pair without internet</h2>
-      <p>On the iPad, tap <b>Pair without internet</b>, then point this camera at the code it shows.</p>
-      <video class="pair-video"></video>
-      <p class="pair-msg"></p>`)
+      <div class="pair-scan">
+        <video class="pair-video"></video>
+        <div>
+          <h2>Scan the iPad’s code</h2>
+          <p>Point the camera at the QR code on the iPad — the normal one, or the one from <b>Pair without internet</b>.</p>
+          <p class="pair-msg"></p>
+        </div>
+      </div>`)
     scanner = new QrScanner(overlay.querySelector('video')!)
     let handled = false
     const ok = await scanner.start('environment', (text) => {
       if (handled) return
-      const code = extractOfferCode(text)
-      if (!code) {
-        overlay.querySelector('.pair-msg')!.textContent = 'That code isn’t from the iPad’s pairing screen.'
+      const hit = parseScan(text)
+      if (!hit) {
+        overlay.querySelector('.pair-msg')!.textContent = 'That QR code isn’t from the SNES app on the iPad.'
         return
       }
       handled = true
-      void answer(code)
+      if (hit.type === 'online') {
+        switchConsole(hit.consoleId)
+      } else {
+        if (hit.consoleId) {
+          consoleId = hit.consoleId
+          saveConsoleId(hit.consoleId)
+        }
+        void answer(hit.offerCode)
+      }
     })
     if (!ok) {
       overlay.querySelector('.pair-msg')!.textContent =
-        'Camera unavailable. Instead, scan the iPad’s code with the iPhone Camera app.'
+        'Can’t open the camera. Allow it in Settings › Safari › Camera (or for this app), then try again.'
     }
+  }
+
+  const setPairMsg = (text: string): void => {
+    const msg = overlay.querySelector('.pair-msg')
+    if (msg) msg.textContent = text
   }
 
   /** Step 2: answer the offer and show our code for the iPad's camera. */
@@ -315,11 +380,16 @@ export function runController(root: HTMLElement, consoleId: string): void {
         <div class="pair-qr">${qr.createSvgTag({ cellSize: 4, margin: 4, scalable: true })}</div>
         <div>
           <h2>Show this to the iPad</h2>
-          <p>Hold the iPhone screen up to the iPad’s front camera until it says connected.</p>
-          <p class="pair-msg">Waiting for the iPad…</p>
+          <p>Hold the iPhone screen up to the iPad’s front camera, about 20–30 cm away, until it says connected. Turn the brightness up if it doesn’t pick it up.</p>
+          <p class="pair-msg">Waiting for the iPad to scan…</p>
+          <p class="pair-diag">This phone: ${describeAddresses(session.localAddrs)} · iPad: ${describeAddresses(session.remoteAddrs)}</p>
         </div>
       </div>`)
     overlay.querySelector('.pair-qr')!.setAttribute('data-code', session.code)
+    session.onState((st) => {
+      if (st === 'checking') setPairMsg('iPad scanned it — connecting…')
+      else if (st === 'failed') setPairMsg(unreachableHint(session.localAddrs, session.remoteAddrs))
+    })
     adopt(session.link, () => {
       offlinePairing = false
       overlay.hidden = true
@@ -327,13 +397,8 @@ export function runController(root: HTMLElement, consoleId: string): void {
     })
     // If the devices can't reach each other, say so instead of waiting forever.
     window.setTimeout(() => {
-      if (conn === session.link && !session.link.open) {
-        const msg = overlay.querySelector('.pair-msg')
-        if (msg)
-          msg.textContent =
-            'Still not connected. Make sure both are on the same network — the iPhone’s Personal Hotspot works best; public Wi-Fi often blocks devices from seeing each other.'
-      }
-    }, 20000)
+      if (conn === session.link && !session.link.open) setPairMsg(unreachableHint(session.localAddrs, session.remoteAddrs))
+    }, 25000)
   }
 
   // Opened from the iPhone Camera app via the iPad's offline code.
@@ -341,6 +406,10 @@ export function runController(root: HTMLElement, consoleId: string): void {
   if (hashCode) {
     history.replaceState(null, '', window.location.pathname + window.location.search)
     void answer(hashCode)
+  } else if (!consoleId) {
+    // First launch of the Home Screen app: nothing to connect to yet.
+    setStatus('Tap SCAN and point at the code on the iPad', 'wait')
+    void openScanner()
   }
 
   // Keepalive resend: recovers state if a message was ever missed.
