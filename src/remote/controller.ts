@@ -3,7 +3,7 @@ import qrcode from 'qrcode-generator'
 import { peerLink, type PadLink } from './link'
 import { answerOffer, describeAddresses, OFFLINE_HASH, parseScan, QrScanner, unreachableHint } from './offline'
 import { KeepAwake } from '../keepAwake'
-import { BTN, PAD_PARAM, peerOptions, type ConsoleMessage, type PhoneMessage } from './protocol'
+import { BTN, PAD_PARAM, peerOptions, type ConsoleMessage, type GameSystem, type PhoneMessage } from './protocol'
 
 const RETRY_MS = 1500
 /** The iPad this phone last paired with, so the Home Screen app finds it again. */
@@ -46,7 +46,10 @@ export function runController(root: HTMLElement, initialConsoleId: string | null
   root.innerHTML = `
     <div class="pad">
       <div class="pad-row pad-top">
-        <div class="shoulder" data-btn="${BTN.L}">L</div>
+        <div class="shoulders">
+          <div class="shoulder ps-only" data-btn="${BTN.L2}">L2</div>
+          <div class="shoulder" data-btn="${BTN.L}" data-snes="L" data-ps="L1">L</div>
+        </div>
         <div class="pad-status-wrap">
           <div class="pad-status" id="pad-status">Connecting…</div>
           <div class="pill scan-btn" data-action="scan">
@@ -54,7 +57,10 @@ export function runController(root: HTMLElement, initialConsoleId: string | null
             <span>SCAN iPad CODE</span>
           </div>
         </div>
-        <div class="shoulder" data-btn="${BTN.R}">R</div>
+        <div class="shoulders">
+          <div class="shoulder" data-btn="${BTN.R}" data-snes="R" data-ps="R1">R</div>
+          <div class="shoulder ps-only" data-btn="${BTN.R2}">R2</div>
+        </div>
       </div>
       <div class="pad-row pad-main">
         <div class="dpad" id="dpad">
@@ -70,16 +76,24 @@ export function runController(root: HTMLElement, initialConsoleId: string | null
           <div class="pill menu" data-btn="${BTN.MENU}">MENU</div>
         </div>
         <div class="face" id="face">
-          <div class="fbtn x" data-face="${BTN.X}">X</div>
-          <div class="fbtn y" data-face="${BTN.Y}">Y</div>
-          <div class="fbtn a" data-face="${BTN.A}">A</div>
-          <div class="fbtn b" data-face="${BTN.B}">B</div>
+          <div class="fbtn x" data-face="${BTN.X}" data-snes="X" data-ps="△">X</div>
+          <div class="fbtn y" data-face="${BTN.Y}" data-snes="Y" data-ps="□">Y</div>
+          <div class="fbtn a" data-face="${BTN.A}" data-snes="A" data-ps="○">A</div>
+          <div class="fbtn b" data-face="${BTN.B}" data-snes="B" data-ps="✕">B</div>
         </div>
       </div>
     </div>`
 
   const statusEl = root.querySelector<HTMLElement>('#pad-status')!
   const padEl = root.querySelector<HTMLElement>('.pad')!
+
+  /** SNES or PlayStation layout, as the console tells us. Same buttons, new labels + L2/R2. */
+  const setSystem = (system: GameSystem): void => {
+    padEl.classList.toggle('ps1', system === 'ps1')
+    for (const el of root.querySelectorAll<HTMLElement>('[data-snes]')) {
+      el.textContent = (system === 'ps1' ? el.dataset.ps : el.dataset.snes) ?? ''
+    }
+  }
   const dpad = root.querySelector<HTMLElement>('#dpad')!
   const face = root.querySelector<HTMLElement>('#face')!
   const faceBtns = Array.from(face.querySelectorAll<HTMLElement>('[data-face]'))
@@ -192,7 +206,13 @@ export function runController(root: HTMLElement, initialConsoleId: string | null
     })
     link.onData((raw) => {
       const msg = raw as ConsoleMessage
-      if (conn === link && msg?.t === 'hello') setStatus(`Player ${msg.player}`, 'ok')
+      if (conn !== link || !msg) return
+      if (msg.t === 'hello') {
+        setStatus(`Player ${msg.player}`, 'ok')
+        setSystem(msg.system ?? 'snes')
+      } else if (msg.t === 'system') {
+        setSystem(msg.system)
+      }
     })
     link.onClose(() => {
       if (conn !== link) return
