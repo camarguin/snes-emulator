@@ -20,7 +20,12 @@ export const BTN = {
   LEFT: 14,
   RIGHT: 15,
   MENU: 16, // opens the pause overlay
+  L2: 6, // PS1 only
+  R2: 7, // PS1 only
 } as const
+
+/** Which console is running, so the phone can show the matching layout. */
+export type GameSystem = 'snes' | 'ps1'
 
 export const BUTTON_COUNT = 17
 
@@ -31,7 +36,7 @@ export const VIRTUAL_PAD_ID = 'Phone Controller (snes-remote)'
 export const PAD_PARAM = 'pad'
 
 export type PhoneMessage = { t: 'in'; m: number }
-export type ConsoleMessage = { t: 'hello'; player: number }
+export type ConsoleMessage = { t: 'hello'; player: number; system?: GameSystem } | { t: 'system'; system: GameSystem }
 
 /**
  * PeerJS broker. Only used to introduce the two devices; button presses then

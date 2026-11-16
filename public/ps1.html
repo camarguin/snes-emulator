@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>PS1</title>
+    <!--
+      Runs EmulatorJS (GPL-3.0, https://github.com/EmulatorJS/EmulatorJS) with the
+      PCSX-ReARMed core inside an iframe of the main app. The app owns the UI
+      (pause menu, phone controller); this page only hosts the emulator, and is
+      thrown away on exit so the game's memory is freed.
+    -->
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #000;
+        overflow: hidden;
+      }
+      #game {
+        width: 100%;
+        height: 100%;
+      }
+      /* The app provides menus and the phone is the gamepad: hide EmulatorJS's own. */
+      .ejs_menu_bar,
+      .ejs_virtualGamepad_parent,
+      .ejs_context_menu,
+      .ejs_menu_bar_hidden,
+      .ejs_virtualGamepad_open {
+        display: none !important;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="game"></div>
+    <script>
+      ;(function () {
+        const host = window.parent
+        const launch = host.__ps1Launch
+        if (!launch) return
+
+        // Gamepads: the app patches navigator.getGamepads() to include phone
+        // controllers. Read through the parent's so phones work in here too.
+        try {
+          const parentNav = host.navigator
+          navigator.getGamepads = () => parentNav.getGamepads()
+        } catch (e) {}
+
+        // EmulatorJS tests `instanceof Blob`, and each frame has its own Blob
+        // class: re-wrap the parent's files in ours (no data is copied).
+        const local = (f) => (f ? new File([f], f.name || 'file') : '')
+        const extra = {}
+        for (const [path, f] of Object.entries(launch.extra || {})) extra[path] = local(f)
+
+        // Positional mapping, like a real PS1 pad: gamepad bottom/right/left/top
+        // = ✕ ○ □ △. (EmulatorJS's default puts bottom on RetroPad A, which the
+        // PS1 core reads as ○.) RetroPad ids: 0 B=✕, 1 Y=□, 8 A=○, 9 X=△.
+        const pad = (keys) => {
+          const k = (i) => (keys ? keys[i] : '')
+          return {
+            0: { value: k(0), value2: 'BUTTON_1' },
+            1: { value: k(1), value2: 'BUTTON_3' },
+            2: { value: k(2), value2: 'SELECT' },
+            3: { value: k(3), value2: 'START' },
+            4: { value: k(4), value2: 'DPAD_UP' },
+            5: { value: k(5), value2: 'DPAD_DOWN' },
+            6: { value: k(6), value2: 'DPAD_LEFT' },
+            7: { value: k(7), value2: 'DPAD_RIGHT' },
+            8: { value: k(8), value2: 'BUTTON_2' },
+            9: { value: k(9), value2: 'BUTTON_4' },
+            10: { value: k(10), value2: 'LEFT_TOP_SHOULDER' },
+            11: { value: k(11), value2: 'RIGHT_TOP_SHOULDER' },
+            12: { value: k(12), value2: 'LEFT_BOTTOM_SHOULDER' },
+            13: { value: k(13), value2: 'RIGHT_BOTTOM_SHOULDER' },
+          }
+        }
+        const keyboard = ['x', 's', 'v', 'enter', 'up arrow', 'down arrow', 'left arrow', 'right arrow', 'z', 'a', 'q', 'e', 'tab', 'r']
+        const controls = { 0: pad(keyboard), 1: pad(null), 2: {}, 3: {} }
+
+        const off = {}
+        for (const k of [
+          'playPause', 'restart', 'mute', 'settings', 'fullscreen', 'saveState', 'loadState',
+          'screenRecord', 'gamepad', 'cheat', 'volume', 'saveSavFiles', 'loadSavFiles', 'quickSave',
+          'quickLoad', 'screenshot', 'cacheManager', 'exitEmulation', 'netplay', 'diskButton', 'contextMenu',
+        ]) off[k] = false
+
+        Object.assign(window, {
+          EJS_player: '#game',
+          EJS_core: 'pcsx_rearmed',
+          EJS_pathtodata: './emulatorjs/',
+          EJS_gameName: launch.title,
+          // A File keeps its name, so the core sees the right extension (.chd, .cue …).
+          EJS_gameUrl: local(launch.main),
+          EJS_externalFiles: extra,
+          EJS_biosUrl: local(launch.bios),
+          EJS_startOnLoaded: true,
+          EJS_CacheLimit: 0, // games are already stored by the app; don't keep a second copy
+          EJS_threads: false,
+          EJS_language: 'en-US',
+          EJS_disableAutoLang: true,
+          EJS_color: '#e60012',
+          EJS_backgroundColor: '#000',
+          EJS_Buttons: off,
+          EJS_defaultControls: controls,
+          // No settings UI here, and saved settings would override the mapping above.
+          EJS_disableLocalStorage: true,
+          EJS_defaultOptions: { 'save-save-interval': '30' },
+          EJS_onGameStart: () => {
+            syncPads()
+            host.dispatchEvent(new CustomEvent('ps1:started'))
+          },
+        })
+
+        const emu = () => window.EJS_emulator
+        const gm = () => emu() && emu().gameManager
+
+        // EmulatorJS only assigns a gamepad to a player when it sees it
+        // "connect", but pads that already exist when it starts (an already
+        // paired phone) connect before it listens and are never assigned.
+        // Fill empty player slots with any unassigned pad, in pad order.
+        const syncPads = () => {
+          const e = emu()
+          if (!e || !e.gamepad || !Array.isArray(e.gamepadSelection) || !e.gamepadSelection.length) return
+          const known = e.gamepad.gamepads.filter(Boolean).map((p) => p.id + '_' + p.index)
+          let changed = false
+          for (const key of known) {
+            if (e.gamepadSelection.includes(key)) continue
+            const slot = e.gamepadSelection.indexOf('')
+            if (slot < 0) break
+            e.gamepadSelection[slot] = key
+            changed = true
+          }
+          if (changed && typeof e.updateGamepadLabels === 'function') e.updateGamepadLabels()
+        }
+        setInterval(syncPads, 500)
+
+        // Memory-card saves live in IDBFS; write them out and wait for the sync.
+        const flushSaves = () =>
+          new Promise((resolve) => {
+            try {
+              gm().saveSaveFiles()
+              gm().FS.syncfs(false, () => resolve())
+              setTimeout(resolve, 3000)
+            } catch (e) {
+              resolve()
+            }
+          })
+
+        window.ps1 = {
+          pause: () => {
+            emu() && emu().pause()
+            return flushSaves()
+          },
+          play: () => emu() && emu().play(),
+          reset: () => gm() && gm().restart(),
+          getState: () => gm().getState(),
+          loadState: (state) => gm().loadState(state),
+          flushSaves,
+          focus: () => {
+            const c = document.querySelector('canvas')
+            if (c) c.focus()
+          },
+        }
+        setInterval(() => {
+          if (emu() && emu().started) flushSaves()
+        }, 30000)
+        addEventListener('pagehide', () => flushSaves())
+
+        const s = document.createElement('script')
+        s.src = './emulatorjs/loader.js'
+        document.body.appendChild(s)
+      })()
+    </script>
+  </body>

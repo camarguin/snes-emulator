@@ -1,6 +1,6 @@
 import { Peer } from 'peerjs'
 import { peerLink, type PadLink } from './link'
-import { BUTTON_COUNT, PAD_PARAM, VIRTUAL_PAD_ID, peerOptions, type ConsoleMessage, type PhoneMessage } from './protocol'
+import { BUTTON_COUNT, PAD_PARAM, VIRTUAL_PAD_ID, peerOptions, type ConsoleMessage, type GameSystem, type PhoneMessage } from './protocol'
 
 const ID_STORAGE_KEY = 'snes-remote-console-id'
 const ID_PREFIX = 'snes-console-'
@@ -36,6 +36,16 @@ export class RemoteHost {
 
   constructor() {
     this.id = loadId() ?? newId()
+  }
+
+  private system: GameSystem = 'snes'
+
+  /** Tell every phone which console is running (PS1 has L2/R2 and ✕○□△). */
+  setSystem(system: GameSystem): void {
+    if (system === this.system) return
+    this.system = system
+    const msg: ConsoleMessage = { t: 'system', system }
+    for (const pad of this.pads) pad.link.send(msg)
   }
 
   get phoneCount(): number {
@@ -149,7 +159,7 @@ export class RemoteHost {
       pad.timestamp = performance.now()
       this.pads.push(pad)
       const player = this.playerOf(pad)
-      const hello: ConsoleMessage = { t: 'hello', player }
+      const hello: ConsoleMessage = { t: 'hello', player, system: this.system }
       link.send(hello)
       this.onPhoneConnected?.(player)
       this.onChange?.()

@@ -18,11 +18,9 @@ function sanitizeNamespace(file: string): string {
   return stem.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64) || 'game'
 }
 
-export class Player {
+export class Player implements GamePlayer {
   private engine: EngineHandle | null = null
-  private comboRafId = 0
-  private comboWasPressed = false
-  private comboKeyHandler: ((e: KeyboardEvent) => void) | null = null
+  private stopComboWatch: (() => void) | null = null
   onPauseToggle: (() => void) | null = null
 
   async launch(game: GameEntry, romBytes: Uint8Array, canvas: HTMLCanvasElement): Promise<void> {
@@ -41,27 +39,8 @@ export class Player {
     this.startComboWatch()
   }
 
-  /** Start+Select (View+Menu) toggles the pause overlay; Escape too on desktop. */
   private startComboWatch(): void {
-    this.comboKeyHandler = (e: KeyboardEvent) => {
-      if (e.code === 'Escape' && !e.repeat) this.onPauseToggle?.()
-    }
-    window.addEventListener('keydown', this.comboKeyHandler)
-    const poll = () => {
-      this.comboRafId = requestAnimationFrame(poll)
-      let pressed = false
-      for (const pad of navigator.getGamepads?.() ?? []) {
-        if (!pad?.connected) continue
-        // Start+Select, or the phone controller's dedicated Menu button (16).
-        if ((!!pad.buttons[8]?.pressed && !!pad.buttons[9]?.pressed) || !!pad.buttons[16]?.pressed) {
-          pressed = true
-          break
-        }
-      }
-      if (pressed && !this.comboWasPressed) this.onPauseToggle?.()
-      this.comboWasPressed = pressed
-    }
-    this.comboRafId = requestAnimationFrame(poll)
+    this.stopComboWatch = watchPauseCombo(() => this.onPauseToggle?.())
   }
 
   pause(): void {
@@ -87,8 +66,8 @@ export class Player {
   }
 
   exit(): void {
-    cancelAnimationFrame(this.comboRafId)
-    if (this.comboKeyHandler) window.removeEventListener('keydown', this.comboKeyHandler)
+    this.stopComboWatch?.()
+    this.stopComboWatch = null
     this.engine?.destroy()
     this.engine = null
   }
@@ -100,4 +79,46 @@ export function requestFullscreen(): void {
 
 export function exitFullscreen(): void {
   if (document.fullscreenElement) void document.exitFullscreen()
+}
+
+/** What main.ts needs from a running game, whichever console it is. */
+export interface GamePlayer {
+  onPauseToggle: (() => void) | null
+  pause(): void
+  resume(): void
+  reset(): void
+  saveState(): Promise<Uint8Array>
+  loadState(data: Uint8Array): Promise<void>
+  exit(): void | Promise<void>
+}
+
+/**
+ * Start+Select (View+Menu), the phone's Menu button (16) or Escape toggle the
+ * pause overlay. Returns a stop function.
+ */
+export function watchPauseCombo(onToggle: () => void): () => void {
+  let wasPressed = false
+  let raf = 0
+  const onKey = (e: KeyboardEvent) => {
+    if (e.code === 'Escape' && !e.repeat) onToggle()
+  }
+  window.addEventListener('keydown', onKey)
+  const poll = () => {
+    raf = requestAnimationFrame(poll)
+    let pressed = false
+    for (const pad of navigator.getGamepads?.() ?? []) {
+      if (!pad?.connected) continue
+      if ((!!pad.buttons[8]?.pressed && !!pad.buttons[9]?.pressed) || !!pad.buttons[16]?.pressed) {
+        pressed = true
+        break
+      }
+    }
+    if (pressed && !wasPressed) onToggle()
+    wasPressed = pressed
+  }
+  raf = requestAnimationFrame(poll)
+  return () => {
+    cancelAnimationFrame(raf)
+    window.removeEventListener('keydown', onKey)
+  }
 }

@@ -1,12 +1,13 @@
 // Offline support: the app shell and emulator engine are served from this
 // cache, so the installed app opens on a train with no signal. ROMs and save
 // states already live in IndexedDB; the game list is kept in localStorage.
-const CACHE = 'snes-shell-v1'
+const CACHE = 'snes-shell-v2'
 // Hosts may send `Vary: Origin`; module scripts carry an Origin header and
 // precached copies don't, so lookups must ignore Vary or they'd always miss.
 const MATCH = { ignoreVary: true }
 const CORE = [
   './',
+  './ps1.html',
   './manifest.webmanifest',
   './icons/icon-192.png',
   './icons/icon-512.png',
@@ -69,19 +70,26 @@ self.addEventListener('fetch', (event) => {
   }
 })
 
-/** Fresh page when the network is good; cached page if it's slow or gone. */
+/**
+ * Fresh page when the network is good; cached copy if it's slow or gone.
+ * Each page is cached under its own path (the app shell at ./, the PS1 frame
+ * at ./ps1.html), ignoring the query string (?pad=… is the same page).
+ */
 async function networkFirst(req) {
   const cache = await caches.open(CACHE)
-  const fallback = () => cache.match('./', MATCH)
+  const url = new URL(req.url)
+  url.search = ''
+  url.hash = ''
+  const key = url.pathname.endsWith('/') || url.pathname.endsWith('/index.html') ? new URL('./', self.registration.scope).href : url.href
   try {
     const res = await Promise.race([
       fetch(req),
       new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), NAV_TIMEOUT_MS)),
     ])
-    if (res.ok) cache.put('./', res.clone())
+    if (res.ok) cache.put(key, res.clone())
     return res
   } catch {
-    return (await fallback()) || Response.error()
+    return (await cache.match(key, MATCH)) || Response.error()
   }
 }
 

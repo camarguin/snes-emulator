@@ -1,7 +1,10 @@
 import './style.css'
 import { MenuInput, type MenuAction } from './input'
 import { fetchLibrary, fetchRom, type GameEntry } from './library'
-import { exitFullscreen, Player, requestFullscreen } from './player'
+import { exitFullscreen, Player, requestFullscreen, type GamePlayer } from './player'
+import { Ps1Player } from './ps1/player'
+import { deletePs1Game, getBios, importPs1Files, listPs1Games, PS1_ACCEPT, type Ps1Game } from './ps1/store'
+import { warmPs1Cache } from './ps1/assets'
 import { getSaveState, listCachedRoms, putSaveState } from './db'
 import { ROM_REPO } from './config'
 import qrcode from 'qrcode-generator'
@@ -15,16 +18,33 @@ const app = document.querySelector<HTMLDivElement>('#app')!
 
 type Screen = 'library' | 'loading' | 'game'
 
+/** One row of the library, whichever console it's for. */
+type Entry = { system: 'snes'; game: GameEntry } | { system: 'ps1'; game: Ps1Game }
+
 let screen: Screen = 'library'
 let games: GameEntry[] = []
+let ps1Games: Ps1Game[] = []
+let biosName: string | null = null
+let snesError: string | null = null
+let ps1Notice: string | null = null
 let libraryOffline = false
 let cachedRoms = new Set<string>()
 let focusedIndex = 0
-let currentGame: GameEntry | null = null
+let currentGame: Entry | null = null
 let hasSaveState = false
 
 const menuInput = new MenuInput()
-const player = new Player()
+const snesPlayer = new Player()
+const ps1Player = new Ps1Player()
+/** Whichever player is running the current game. */
+let player: GamePlayer = snesPlayer
+
+function entries(): Entry[] {
+  return [
+    ...games.map((game): Entry => ({ system: 'snes', game })),
+    ...ps1Games.map((game): Entry => ({ system: 'ps1', game })),
+  ]
+}
 const remote = new RemoteHost()
 const keepAwake = new KeepAwake()
 
@@ -44,19 +64,21 @@ function render(): void {
 // ------------------------------------------------------------- library view
 
 function renderLibrary(): void {
-  const items = games
-    .map((g, i) => {
-      const saved = cachedRoms.has(g.file)
-      const cls = `game${i === focusedIndex ? ' focused' : ''}${libraryOffline && !saved ? ' unavailable' : ''}`
+  const list = entries()
+  focusedIndex = Math.min(focusedIndex, Math.max(0, list.length - 1))
+  const row = (e: Entry, i: number) => {
+    const focused = i === focusedIndex ? ' focused' : ''
+    if (e.system === 'snes') {
+      const saved = cachedRoms.has(e.game.file)
+      const cls = `game${focused}${libraryOffline && !saved ? ' unavailable' : ''}`
       const badge = saved ? `<span class="badge">Offline ready</span>` : ''
-      return `<li><button class="${cls}" data-index="${i}"><span class="title">${escapeHtml(g.title)}</span>${badge}</button></li>`
-    })
-    .join('\n')
-
-  const body =
-    games.length === 0
-      ? `<p class="empty">No games found.</p>`
-      : `<ul class="games">${items}</ul>`
+      return `<li><button class="${cls}" data-index="${i}"><span class="title">${escapeHtml(e.game.title)}</span>${badge}</button></li>`
+    }
+    const mb = `${Math.round(e.game.size / 1e6)} MB`
+    return `<li class="ps1-row"><button class="game${focused}" data-index="${i}"><span class="title">${escapeHtml(e.game.title)}</span><span class="badge">On this iPad · ${mb}</span></button><button class="remove" data-remove="${escapeHtml(e.game.id)}" aria-label="Remove ${escapeHtml(e.game.title)}">✕</button></li>`
+  }
+  const snesRows = list.map((e, i) => (e.system === 'snes' ? row(e, i) : '')).join('')
+  const ps1Rows = list.map((e, i) => (e.system === 'ps1' ? row(e, i) : '')).join('')
 
   app.innerHTML = `
     <div class="library">
@@ -66,7 +88,22 @@ function renderLibrary(): void {
       </header>
       ${isPhone() ? `<a class="use-as-pad" href="?${PAD_PARAM}=scan">Use this phone as a controller</a>` : ''}
       ${libraryOffline ? `<p class="offline-note">No internet — games marked “Offline ready” can still be played.</p>` : ''}
-      ${body}
+      <div class="games">
+        <h2 class="section">Super Nintendo</h2>
+        <div class="col">
+          ${snesError ? `<p class="empty">${escapeHtml(snesError)}</p>` : games.length ? `<ul>${snesRows}</ul>` : `<p class="empty">No games found.</p>`}
+        </div>
+        <h2 class="section">PlayStation</h2>
+        <div class="col">
+          ${ps1Notice ? `<p class="ps1-notice">${escapeHtml(ps1Notice)}</p>` : ''}
+          ${ps1Games.length ? `<ul>${ps1Rows}</ul>` : `<p class="empty small">No PlayStation games yet. Copy them to this iPad (AirDrop or iCloud Drive), then add them here — they stay on the iPad and play offline.</p>`}
+          <div class="ps1-actions">
+            <button class="add-ps1" data-action="add-ps1">+ Add PS1 games from Files</button>
+            <span class="bios-status">BIOS: ${biosName ? escapeHtml(biosName) : 'built-in (add a real one with the same button for better compatibility)'}</span>
+          </div>
+          <input type="file" id="ps1-input" multiple accept="${PS1_ACCEPT}" hidden />
+        </div>
+      </div>
       ${phoneCard()}
       <footer>
         <span>Tap / A / Enter — Play</span>
@@ -74,14 +111,71 @@ function renderLibrary(): void {
         <span>In game: Start+Select (or MENU on phone) — Menu</span>
       </footer>
     </div>`
+  app.querySelector<HTMLInputElement>('#ps1-input')!.addEventListener('change', (e) => {
+    const input = e.target as HTMLInputElement
+    const files = Array.from(input.files ?? [])
+    input.value = ''
+    if (files.length) void addPs1Games(files)
+  })
+  app.querySelector('.games button.focused')?.scrollIntoView({ block: 'nearest' })
 }
 
 app.addEventListener('click', (e) => {
-  const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('button.game')
+  const target = e.target as HTMLElement
+  if (target.closest('[data-action="add-ps1"]')) {
+    app.querySelector<HTMLInputElement>('#ps1-input')?.click()
+    return
+  }
+  const remove = target.closest<HTMLButtonElement>('button.remove')
+  if (remove?.dataset.remove) {
+    void removePs1Game(remove.dataset.remove)
+    return
+  }
+  const btn = target.closest<HTMLButtonElement>('button.game')
   if (!btn) return
   const index = Number(btn.dataset.index)
-  if (!Number.isNaN(index)) void playGame(games[index], true)
+  const entry = entries()[index]
+  if (entry) void playGame(entry, true)
 })
+
+// ------------------------------------------------------------ PS1 library
+
+async function refreshPs1(): Promise<void> {
+  ps1Games = await listPs1Games()
+  biosName = (await getBios())?.name ?? null
+}
+
+async function addPs1Games(files: File[]): Promise<void> {
+  if (screen !== 'library') return
+  screen = 'loading'
+  showLoading('Adding PS1 games')
+  const status = document.getElementById('load-status')
+  const mb = files.reduce((n, f) => n + f.size, 0) / 1e6
+  if (status) status.textContent = `Copying ${mb.toFixed(0)} MB onto this iPad… this can take a minute.`
+  try {
+    const res = await importPs1Files(files)
+    const parts: string[] = []
+    if (res.added.length) parts.push(`Added ${res.added.map((g) => `“${g.title}”`).join(', ')}.`)
+    if (res.bios) parts.push('PS1 BIOS saved — it will be used for every game.')
+    parts.push(...res.errors)
+    ps1Notice = parts.join(' ') || null
+    if (res.added.length) warmPs1Cache()
+  } catch (err) {
+    ps1Notice = `Couldn’t add those files: ${err instanceof Error ? err.message : String(err)}`
+  }
+  await refreshPs1()
+  screen = 'library'
+  render()
+}
+
+async function removePs1Game(id: string): Promise<void> {
+  const game = ps1Games.find((g) => g.id === id)
+  if (!game || !window.confirm(`Remove “${game.title}” from this iPad? Your in-game saves are kept.`)) return
+  await deletePs1Game(id)
+  await refreshPs1()
+  ps1Notice = `Removed “${game.title}”.`
+  render()
+}
 
 // ------------------------------------------------------------ loading state
 
@@ -268,8 +362,10 @@ function closeOfflinePairing(): void {
 remote.onPhoneConnected = (n) => toast(`Phone connected — Player ${n}`)
 remote.onPhoneDisconnected = (n) => toast(`Player ${n} phone disconnected`)
 
-async function playGame(game: GameEntry, fromTouch = false): Promise<void> {
+async function playGame(entry: Entry, fromTouch = false): Promise<void> {
   if (screen !== 'library') return
+  if (entry.system === 'ps1') return playPs1(entry.game, fromTouch)
+  const game = entry.game
   screen = 'loading'
   showLoading(game.title)
   try {
@@ -283,22 +379,21 @@ async function playGame(game: GameEntry, fromTouch = false): Promise<void> {
     canvas.id = 'screen'
     app.innerHTML = ''
     app.appendChild(canvas)
+    player = snesPlayer
+    remote.setSystem('snes')
     screen = 'game'
     updateKeepAwake()
-    currentGame = game
-    hasSaveState = (await getSaveState(saveKey(game))) !== null
+    currentGame = entry
+    hasSaveState = (await getSaveState(saveKey(entry))) !== null
     stopMenuNav()
 
     requestFullscreen()
-    await player.launch(game, romBytes, canvas)
-    player.onPauseToggle = () => togglePause()
-    // Started from a phone: iPadOS keeps audio muted until the screen itself
-    // is touched once.
-    if (!fromTouch && remote.phoneCount > 0 && /iPad|iPhone|Macintosh/.test(navigator.userAgent) && 'ontouchend' in document) {
-      toast('Tap the iPad screen once to turn on sound')
-    }
+    await snesPlayer.launch(game, romBytes, canvas)
+    snesPlayer.onPauseToggle = () => togglePause()
+    soundHint(fromTouch)
   } catch (err) {
-    player.exit()
+    snesPlayer.exit()
+    remote.setSystem('snes')
     const offline = !navigator.onLine || err instanceof TypeError
     showError(
       offline && !cachedRoms.has(game.file)
@@ -310,8 +405,41 @@ async function playGame(game: GameEntry, fromTouch = false): Promise<void> {
   }
 }
 
-function saveKey(game: GameEntry): string {
-  return `${game.file}:slot0`
+async function playPs1(game: Ps1Game, fromTouch: boolean): Promise<void> {
+  screen = 'game'
+  app.innerHTML = ''
+  const host = document.createElement('div')
+  host.id = 'ps1-host'
+  app.appendChild(host)
+  player = ps1Player
+  remote.setSystem('ps1')
+  updateKeepAwake()
+  currentGame = { system: 'ps1', game }
+  hasSaveState = (await getSaveState(saveKey(currentGame))) !== null
+  stopMenuNav()
+  requestFullscreen()
+  ps1Player.onPauseToggle = () => togglePause()
+  try {
+    await ps1Player.launch(game, await getBios(), host)
+    soundHint(fromTouch)
+  } catch (err) {
+    await ps1Player.exit()
+    remote.setSystem('snes')
+    currentGame = null
+    updateKeepAwake()
+    showError(err instanceof Error ? err.message : String(err))
+  }
+}
+
+/** Started from a phone: iPadOS keeps audio muted until the screen itself is touched once. */
+function soundHint(fromTouch: boolean): void {
+  if (!fromTouch && remote.phoneCount > 0 && /iPad|iPhone|Macintosh/.test(navigator.userAgent) && 'ontouchend' in document) {
+    toast('Tap the iPad screen once to turn on sound')
+  }
+}
+
+function saveKey(entry: Entry): string {
+  return entry.system === 'snes' ? `${entry.game.file}:slot0` : `ps1:${entry.game.id}:slot0`
 }
 
 // ------------------------------------------------------------ pause overlay
@@ -430,15 +558,18 @@ async function doLoadState(): Promise<void> {
   }
 }
 
-function exitToLibrary(): void {
+async function exitToLibrary(): Promise<void> {
   paused = false
   stopMenuNav()
-  player.exit()
+  if (player === ps1Player) toast('Saving memory card…')
+  await player.exit()
+  remote.setSystem('snes')
   exitFullscreen()
   currentGame = null
   screen = 'library'
   updateKeepAwake()
   render()
+  startMenuNav(libraryNav)
 }
 
 // ------------------------------------------------------------------- toast
@@ -474,15 +605,16 @@ function stopMenuNav(): void {
 }
 
 function libraryNav(action: MenuAction): void {
-  if (games.length === 0) return
+  const list = entries()
+  if (list.length === 0 || screen !== 'library') return
   if (action === 'up') {
-    focusedIndex = (focusedIndex - 1 + games.length) % games.length
+    focusedIndex = (focusedIndex - 1 + list.length) % list.length
     renderLibrary()
   } else if (action === 'down') {
-    focusedIndex = (focusedIndex + 1) % games.length
+    focusedIndex = (focusedIndex + 1) % list.length
     renderLibrary()
   } else if (action === 'select') {
-    void playGame(games[focusedIndex])
+    void playGame(list[focusedIndex])
   }
 }
 
@@ -499,15 +631,13 @@ async function boot(): Promise<void> {
     libraryOffline = lib.offline
     cachedRoms = await listCachedRoms()
   } catch (err) {
-    showError(
-      `${err instanceof Error ? err.message : String(err)}\n\n` +
-        `Upload your .sfc/.smc files and a manifest.json listing them to github.com/${ROM_REPO.owner}/${ROM_REPO.repo}`,
-    )
-    startMenuNav(() => {
-      window.location.reload()
-    })
-    return
+    // PS1 games live on the iPad, so a missing SNES list isn't fatal.
+    snesError =
+      `${err instanceof Error ? err.message : String(err)}. ` +
+      `Upload .sfc/.smc files and a manifest.json to github.com/${ROM_REPO.owner}/${ROM_REPO.repo}.`
   }
+  await refreshPs1()
+  if (ps1Games.length && navigator.onLine) warmPs1Cache()
   screen = 'library'
   render()
   startMenuNav(libraryNav)

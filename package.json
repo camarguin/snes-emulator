@@ -4,7 +4,7 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "copy-engine": "node -e \"const fs=require('fs');fs.mkdirSync('public/engine',{recursive:true});fs.copyFileSync('node_modules/@wasm-gaming/snes9x-wasm/dist/snes9x/snes9x.js','public/engine/snes9x.js');fs.copyFileSync('node_modules/@wasm-gaming/snes9x-wasm/dist/snes9x/snes9x.wasm','public/engine/snes9x.wasm')\"",
+    "copy-engine": "node scripts/copy-engines.mjs",
     "dev": "npm run copy-engine && vite",
     "build": "npm run copy-engine && tsc && vite build",
     "preview": "npm run copy-engine && vite preview"
@@ -14,6 +14,8 @@
     "vite": "^8.2.0"
   },
   "dependencies": {
+    "@emulatorjs/core-pcsx_rearmed": "^4.2.3",
+    "@emulatorjs/emulatorjs": "^4.2.3",
     "@wasm-gaming/engine-specs": "^0.3.2",
     "@wasm-gaming/snes9x-wasm": "^0.1.1",
     "jsqr": "^1.4.0",
